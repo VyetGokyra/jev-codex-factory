@@ -18,14 +18,27 @@ def resolve_state(arg=None):
             raise SystemExit(f"State file not found: {arg}")
         return p.resolve()
 
+    preferred = sorted(
+        STATE_DIR.glob("run-*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    if preferred:
+        return preferred[0]
+
     candidates = sorted(
-        STATE_DIR.glob("*.json"),
+        [
+            *STATE_DIR.glob("blocked-*.json"),
+            *STATE_DIR.glob("verify-fail-*.json"),
+            *STATE_DIR.glob("conflict-*.json"),
+        ],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
 
     if not candidates:
-        raise SystemExit("No state files found.")
+        raise SystemExit("No run state files found.")
 
     return candidates[0]
 
@@ -95,12 +108,20 @@ def main():
     if state.get("target_root"):
         print("Target:", state["target_root"])
 
+    if state.get("execution_shape"):
+        print("Shape :", state["execution_shape"])
+
+    if state.get("status"):
+        print("Status:", state["status"])
+
     print()
     print(
         f"{'':2} "
         f"{'TASK':22} "
         f"{'STATUS':16} "
-        f"{'MODEL':14} "
+        f"{'MODEL':16} "
+        f"{'EFFORT':8} "
+        f"{'CONF':6} "
         f"{'TRY':4} "
         f"{'VERIFY':10} "
         f"{'REASON'}"
@@ -128,6 +149,14 @@ def main():
             or "-"
         )
 
+        effort = r.get("effort") or "-"
+
+        confidence = r.get("jev_confidence")
+        if isinstance(confidence, (int, float)):
+            confidence = f"{confidence:.2f}"
+        else:
+            confidence = "-"
+
         attempts = r.get("attempts", "-")
 
         verify = (
@@ -142,7 +171,9 @@ def main():
             f"{status_icon(status):2} "
             f"{short(task_id, 22):22} "
             f"{status:16} "
-            f"{short(model, 14):14} "
+            f"{short(model, 16):16} "
+            f"{short(effort, 8):8} "
+            f"{confidence:6} "
             f"{str(attempts):4} "
             f"{short(verify, 10):10} "
             f"{short(reason, 30)}"
