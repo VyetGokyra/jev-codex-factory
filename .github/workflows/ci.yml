@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Shell syntax
+        run: |
+          bash -n install.sh
+          bash -n scripts/doctor.sh
+          bash -n scripts/run.sh
+          bash -n scripts/verify.sh
+
+      - name: Python syntax
+        run: |
+          python -m py_compile \
+            scripts/factory.py \
+            scripts/resume.py \
+            scripts/status.py \
+            scripts/states.py \
+            scripts/jev_router.py \
+            scripts/jev_shape.py \
+            scripts/jev_after_run.py
+
+      - name: Validate JSON schemas
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          schemas = list(Path("schemas").glob("*.json"))
+
+          if not schemas:
+              raise SystemExit("No schemas found")
+
+          for path in schemas:
+              json.loads(path.read_text())
+              print("valid:", path)
+          PY
