@@ -21,8 +21,15 @@ STATE_ROOT.mkdir(exist_ok=True)
 LOG_ROOT.mkdir(exist_ok=True)
 
 
-def run(cmd, cwd=None, capture=False, check=False):
+def run(cmd, cwd=None, capture=False, check=False, env=None):
     print("+", " ".join(str(x) for x in cmd))
+
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update({
+            str(k): str(v)
+            for k, v in env.items()
+        })
 
     return subprocess.run(
         [str(x) for x in cmd],
@@ -30,6 +37,7 @@ def run(cmd, cwd=None, capture=False, check=False):
         text=True,
         capture_output=capture,
         check=check,
+        env=merged_env,
     )
 
 
@@ -89,10 +97,79 @@ def run_single(task):
     print(" SINGLE AGENT")
     print("=====================================")
 
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+
+    telemetry_dir = STATE_ROOT / "workers" / run_id
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
+
+    telemetry_path = telemetry_dir / "single-agent.json"
+    state_file = STATE_ROOT / f"run-{run_id}.json"
+
+    if telemetry_path.exists():
+        telemetry_path.unlink()
+
+    started_at = time.time()
+
     r = run(
         [ENGINE_ROOT / "scripts" / "run.sh", task],
         cwd=TARGET_ROOT,
+        env={
+            "JEV_TELEMETRY_FILE": telemetry_path,
+            "JEV_RUN_ID": run_id,
+            "JEV_TASK_ID": "single-agent",
+        },
     )
+
+    telemetry = load_worker_telemetry(telemetry_path)
+
+    worker_status = telemetry.get("worker_status")
+
+    if r.returncode == 0:
+        status = "COMPLETED"
+        reason = None
+    elif worker_status == "FAILED":
+        status = "FAILED"
+        reason = f"WORKER_EXIT_{r.returncode}"
+    else:
+        status = "BLOCKED"
+        reason = f"WORKER_EXIT_{r.returncode}"
+
+    result = {
+        "task": {
+            "id": "single-agent",
+            "title": task,
+            "prompt": task,
+            "files": [],
+            "depends_on": [],
+            "acceptance": [],
+        },
+        "status": status,
+        "reason": reason,
+    }
+
+    result.update(telemetry)
+
+    state = {
+        "version": 1,
+        "run_id": run_id,
+        "execution_shape": "SINGLE_AGENT",
+        "target_root": str(TARGET_ROOT),
+        "original_task": task,
+        "started_at": started_at,
+        "finished_at": time.time(),
+        "results": [result],
+    }
+
+    state_file.write_text(
+        json.dumps(state, indent=2) + "\n"
+    )
+
+    print()
+    print("=====================================")
+    print(" RUN STATE")
+    print("=====================================")
+    print("Run   :", run_id)
+    print("State :", state_file)
 
     raise SystemExit(r.returncode)
 
@@ -241,6 +318,21 @@ Rules:
 """
 
 
+def load_worker_telemetry(path):
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception as exc:
+        print(f"Warning: telemetry read failed: {exc}")
+
+    return {}
+
+
+def with_telemetry(result, telemetry_path):
+    result.update(load_worker_telemetry(telemetry_path))
+    return result
+
+
 def run_worker(run_id, task, base_commit):
     tid = sanitize(task["id"])
     branch = f"jev/{run_id}/{tid}"
@@ -249,6 +341,13 @@ def run_worker(run_id, task, base_commit):
     wt_root.mkdir(parents=True, exist_ok=True)
 
     wt = wt_root / tid
+
+    telemetry_dir = STATE_ROOT / "workers" / run_id
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
+    telemetry_path = telemetry_dir / f"{tid}.json"
+
+    if telemetry_path.exists():
+        telemetry_path.unlink()
 
     if wt.exists():
         shutil.rmtree(wt)
@@ -283,27 +382,32 @@ def run_worker(run_id, task, base_commit):
             prompt,
         ],
         cwd=wt,
+        env={
+            "JEV_TELEMETRY_FILE": telemetry_path,
+            "JEV_RUN_ID": run_id,
+            "JEV_TASK_ID": tid,
+        },
     )
 
     if worker.returncode != 0:
-        return {
+        return with_telemetry({
             "task": task,
             "status": "BLOCKED",
             "reason": f"WORKER_EXIT_{worker.returncode}",
             "branch": branch,
             "worktree": str(wt),
-        }
+        }, telemetry_path)
 
     status = output(["git", "status", "--porcelain"], cwd=wt)
 
     if not status:
-        return {
+        return with_telemetry({
             "task": task,
             "status": "BLOCKED",
             "reason": "NO_CHANGES_PRODUCED",
             "branch": branch,
             "worktree": str(wt),
-        }
+        }, telemetry_path)
 
     if status:
         run(["git", "add", "-A"], cwd=wt, check=True)
@@ -319,23 +423,23 @@ def run_worker(run_id, task, base_commit):
         )
 
         if commit.returncode != 0:
-            return {
+            return with_telemetry({
                 "task": task,
                 "status": "BLOCKED",
                 "reason": "COMMIT_FAILED",
                 "branch": branch,
                 "worktree": str(wt),
-            }
+            }, telemetry_path)
 
     commit_sha = output(["git", "rev-parse", "HEAD"], cwd=wt)
 
-    return {
+    return with_telemetry({
         "task": task,
         "status": "READY_TO_MERGE",
         "branch": branch,
         "commit": commit_sha,
         "worktree": str(wt),
-    }
+    }, telemetry_path)
 
 
 def merge_worker(result):

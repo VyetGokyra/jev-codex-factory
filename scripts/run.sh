@@ -44,6 +44,75 @@ print(x["confidence"])
 ' <<< "$RESULT"
 )"
 
+ROUTE_DECISION="$DECISION"
+
+write_telemetry() {
+    local status="${1:-UNKNOWN}"
+    local verify_result="${2:-NOT_RUN}"
+    local codex_exit="${3:-}"
+    local attempts="${4:-0}"
+
+    [ -z "${JEV_TELEMETRY_FILE:-}" ] && return 0
+
+    mkdir -p "$(dirname "$JEV_TELEMETRY_FILE")"
+
+    TELEMETRY_STATUS="$status" \
+    TELEMETRY_VERIFY="$verify_result" \
+    TELEMETRY_CODEX_EXIT="$codex_exit" \
+    TELEMETRY_ATTEMPTS="$attempts" \
+    TELEMETRY_ROUTE_DECISION="${ROUTE_DECISION:-}" \
+    TELEMETRY_WORKER="${WORKER:-${DECISION:-}}" \
+    TELEMETRY_MODEL="${MODEL:-}" \
+    TELEMETRY_EFFORT="${EFFORT:-}" \
+    TELEMETRY_CONFIDENCE="${CONFIDENCE:-}" \
+    TELEMETRY_RUN_ID="${JEV_RUN_ID:-}" \
+    TELEMETRY_TASK_ID="${JEV_TASK_ID:-}" \
+    python - "$JEV_TELEMETRY_FILE" <<'PYTELEMETRY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+
+def maybe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def maybe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+data = {
+    "run_id": os.environ.get("TELEMETRY_RUN_ID") or None,
+    "task_id": os.environ.get("TELEMETRY_TASK_ID") or None,
+    "route_decision": os.environ.get("TELEMETRY_ROUTE_DECISION") or None,
+    "worker": os.environ.get("TELEMETRY_WORKER") or None,
+    "model": os.environ.get("TELEMETRY_MODEL") or None,
+    "effort": os.environ.get("TELEMETRY_EFFORT") or None,
+    "jev_confidence": maybe_float(
+        os.environ.get("TELEMETRY_CONFIDENCE")
+    ),
+    "attempts": maybe_int(
+        os.environ.get("TELEMETRY_ATTEMPTS")
+    ),
+    "codex_exit": maybe_int(
+        os.environ.get("TELEMETRY_CODEX_EXIT")
+    ),
+    "verify_result": os.environ.get("TELEMETRY_VERIFY") or None,
+    "worker_status": os.environ.get("TELEMETRY_STATUS") or None,
+}
+
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(data, indent=2) + "\n")
+tmp.replace(path)
+PYTELEMETRY
+}
+
 echo
 echo "Decision   : $DECISION"
 echo "Confidence : $CONFIDENCE"
@@ -60,6 +129,7 @@ if [ "$LOW_CONF" = "yes" ]; then
 
     if [ "$DECISION" = "STOP_AND_REPORT" ]; then
         echo "STOP_AND_REPORT"
+        write_telemetry "BLOCKED" "NOT_RUN" "" "0"
         exit 2
     fi
 
@@ -147,19 +217,28 @@ case "$DECISION" in
         ;;
 
     VERIFY_ONLY)
+        WORKER="VERIFY_ONLY"
+        MODEL=""
+        EFFORT=""
+
         if run_verify; then
             echo
             echo "DONE: verification passed."
+            write_telemetry "COMPLETED" "PASS" "" "0"
             exit 0
         else
+            VERIFY_EXIT=$?
             echo
             echo "Verification failed."
-            exit 1
+            write_telemetry "FAILED" "FAIL" "" "0"
+            exit "$VERIFY_EXIT"
         fi
         ;;
 
     STOP_AND_REPORT)
+        WORKER="STOP_AND_REPORT"
         echo "Jev requested STOP_AND_REPORT."
+        write_telemetry "BLOCKED" "NOT_RUN" "" "0"
         exit 2
         ;;
 
@@ -183,7 +262,12 @@ while true; do
     echo
     echo "Codex exit code: $CODEX_EXIT"
 
-    if run_verify; then
+    set +e
+    run_verify
+    VERIFY_EXIT=$?
+    set -e
+
+    if [ "$VERIFY_EXIT" -eq 0 ]; then
         echo
         echo "====================================="
         echo " DONE"
@@ -191,10 +275,15 @@ while true; do
         echo "Worker   : $WORKER"
         echo "Attempts : $ATTEMPTS"
         echo "Verify   : PASS"
+        write_telemetry "COMPLETED" "PASS" "$CODEX_EXIT" "$ATTEMPTS"
         exit 0
     fi
 
-    VERIFY_EXIT=$?
+    if [ "$VERIFY_EXIT" -eq 2 ]; then
+        VERIFY_RESULT="INCONCLUSIVE"
+    else
+        VERIFY_RESULT="FAIL"
+    fi
 
     echo
     echo "Verification failed with exit code: $VERIFY_EXIT"
@@ -202,6 +291,7 @@ while true; do
     if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
         echo "Maximum repair attempts reached."
         echo "STOP_AND_REPORT"
+        write_telemetry "FAILED" "FAIL" "$CODEX_EXIT" "$ATTEMPTS"
         exit 2
     fi
 
