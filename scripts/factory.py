@@ -7,8 +7,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+
+import states
 
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
@@ -20,9 +23,20 @@ LOG_ROOT = ENGINE_ROOT / "logs"
 STATE_ROOT.mkdir(exist_ok=True)
 LOG_ROOT.mkdir(exist_ok=True)
 
+# Git worktree/ref creation mutates shared repository metadata.
+# Serialize only this short critical section; workers still execute in parallel.
+GIT_WORKTREE_LOCK = threading.Lock()
 
-def run(cmd, cwd=None, capture=False, check=False):
+
+def run(cmd, cwd=None, capture=False, check=False, env=None):
     print("+", " ".join(str(x) for x in cmd))
+
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update({
+            str(k): str(v)
+            for k, v in env.items()
+        })
 
     return subprocess.run(
         [str(x) for x in cmd],
@@ -30,6 +44,7 @@ def run(cmd, cwd=None, capture=False, check=False):
         text=True,
         capture_output=capture,
         check=check,
+        env=merged_env,
     )
 
 
@@ -89,10 +104,79 @@ def run_single(task):
     print(" SINGLE AGENT")
     print("=====================================")
 
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+
+    telemetry_dir = STATE_ROOT / "workers" / run_id
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
+
+    telemetry_path = telemetry_dir / "single-agent.json"
+    state_file = STATE_ROOT / f"run-{run_id}.json"
+
+    if telemetry_path.exists():
+        telemetry_path.unlink()
+
+    started_at = time.time()
+
     r = run(
         [ENGINE_ROOT / "scripts" / "run.sh", task],
         cwd=TARGET_ROOT,
+        env={
+            "JEV_TELEMETRY_FILE": telemetry_path,
+            "JEV_RUN_ID": run_id,
+            "JEV_TASK_ID": "single-agent",
+        },
     )
+
+    telemetry = load_worker_telemetry(telemetry_path)
+
+    worker_status = telemetry.get("worker_status")
+
+    if r.returncode == 0:
+        status = "COMPLETED"
+        reason = None
+    elif worker_status == "FAILED":
+        status = "FAILED"
+        reason = f"WORKER_EXIT_{r.returncode}"
+    else:
+        status = "BLOCKED"
+        reason = f"WORKER_EXIT_{r.returncode}"
+
+    result = {
+        "task": {
+            "id": "single-agent",
+            "title": task,
+            "prompt": task,
+            "files": [],
+            "depends_on": [],
+            "acceptance": [],
+        },
+        "status": status,
+        "reason": reason,
+    }
+
+    result.update(telemetry)
+
+    state = {
+        "version": 1,
+        "run_id": run_id,
+        "execution_shape": "SINGLE_AGENT",
+        "target_root": str(TARGET_ROOT),
+        "original_task": task,
+        "started_at": started_at,
+        "finished_at": time.time(),
+        "results": [result],
+    }
+
+    state_file.write_text(
+        json.dumps(state, indent=2) + "\n"
+    )
+
+    print()
+    print("=====================================")
+    print(" RUN STATE")
+    print("=====================================")
+    print("Run   :", run_id)
+    print("State :", state_file)
 
     raise SystemExit(r.returncode)
 
@@ -190,19 +274,51 @@ def calculate_waves(tasks):
 
 
 def check_wave_file_overlap(wave):
-    ownership = {}
+    ownership = []
+
+    def normalize_owned_path(filename):
+        key = filename.strip().replace("\\", "/")
+        key = key.rstrip("/")
+
+        if key in {"", "."}:
+            return "."
+
+        while key.startswith("./"):
+            key = key[2:]
+
+        return key
+
+    def overlaps(a, b):
+        if a == "." or b == ".":
+            return True
+
+        if a == b:
+            return True
+
+        return (
+            a.startswith(b + "/")
+            or b.startswith(a + "/")
+        )
 
     for task in wave:
         for filename in task["files"]:
-            key = filename.rstrip("/")
+            key = normalize_owned_path(filename)
 
-            if key in ownership:
-                raise RuntimeError(
-                    f"Parallel ownership conflict: "
-                    f'{task["id"]} and {ownership[key]} both own {filename}'
+            for existing_key, existing_task, existing_filename in ownership:
+                if overlaps(key, existing_key):
+                    raise RuntimeError(
+                        "Parallel ownership conflict: "
+                        f'{task["id"]} owns {filename}, while '
+                        f'{existing_task} owns {existing_filename}'
+                    )
+
+            ownership.append(
+                (
+                    key,
+                    task["id"],
+                    filename,
                 )
-
-            ownership[key] = task["id"]
+            )
 
 
 def worker_prompt(task):
@@ -241,6 +357,125 @@ Rules:
 """
 
 
+def load_worker_telemetry(path):
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception as exc:
+        print(f"Warning: telemetry read failed: {exc}")
+
+    return {}
+
+
+def with_telemetry(result, telemetry_path):
+    result.update(load_worker_telemetry(telemetry_path))
+    return result
+
+
+
+GENERATED_ARTIFACT_NAMES = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+}
+
+GENERATED_ARTIFACT_SUFFIXES = {
+    ".pyc",
+    ".pyo",
+}
+
+
+def find_generated_artifacts(root):
+    root = Path(root)
+    found = []
+
+    for path in root.rglob("*"):
+        if ".git" in path.parts:
+            continue
+
+        if (
+            path.name in GENERATED_ARTIFACT_NAMES
+            or path.suffix in GENERATED_ARTIFACT_SUFFIXES
+        ):
+            found.append(path)
+
+    return found
+
+
+def remove_generated_artifacts(root):
+    import shutil
+
+    for path in find_generated_artifacts(root):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+
+def cleanup_stale_worker_ref(run_id, task_id):
+    branch = f"jev/{run_id}/{task_id}"
+    wt = (
+        Path("/tmp/jev-codex-factory")
+        / str(run_id)
+        / str(task_id)
+    )
+
+    # Remove stale worktree registration/path first.
+    run(
+        ["git", "worktree", "prune"],
+        cwd=TARGET_ROOT,
+    )
+
+    if wt.exists():
+        run(
+            [
+                "git",
+                "worktree",
+                "remove",
+                "--force",
+                str(wt),
+            ],
+            cwd=TARGET_ROOT,
+        )
+
+        # If the path is no longer registered as a worktree but its
+        # directory survived an interrupted run, remove the stale path.
+        if wt.exists():
+            shutil.rmtree(
+                wt,
+                ignore_errors=True,
+            )
+
+    # Branch may remain after an interrupted previous run.
+    branch_check = run(
+        [
+            "git",
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if branch_check.returncode == 0:
+        run(
+            [
+                "git",
+                "branch",
+                "-D",
+                branch,
+            ],
+            cwd=TARGET_ROOT,
+        )
+
+
 def run_worker(run_id, task, base_commit):
     tid = sanitize(task["id"])
     branch = f"jev/{run_id}/{tid}"
@@ -250,26 +485,79 @@ def run_worker(run_id, task, base_commit):
 
     wt = wt_root / tid
 
-    if wt.exists():
-        shutil.rmtree(wt)
+    telemetry_dir = STATE_ROOT / "workers" / run_id
+    telemetry_dir.mkdir(parents=True, exist_ok=True)
+    telemetry_path = telemetry_dir / f"{tid}.json"
 
-    create = run(
-        [
-            "git",
-            "worktree",
-            "add",
-            "-b",
-            branch,
-            wt,
-            base_commit,
-        ],
-        cwd=TARGET_ROOT,
-    )
+    if telemetry_path.exists():
+        telemetry_path.unlink()
+
+    with GIT_WORKTREE_LOCK:
+        cleanup_stale_worker_ref(
+            run_id,
+            tid,
+        )
+
+        create = run(
+            [
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                wt,
+                base_commit,
+            ],
+            cwd=TARGET_ROOT,
+        )
+
+    if create.returncode != 0:
+        print(f"Retrying worktree creation for {tid}...")
+
+        time.sleep(0.25)
+
+        with GIT_WORKTREE_LOCK:
+            run(
+                ["git", "worktree", "prune"],
+                cwd=TARGET_ROOT,
+            )
+
+            # Remove a partially-created branch only if it exists and
+            # is not checked out anywhere.
+            branch_exists = subprocess.run(
+                [
+                    "git",
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                ],
+                cwd=TARGET_ROOT,
+            ).returncode == 0
+
+            if branch_exists:
+                subprocess.run(
+                    ["git", "branch", "-D", branch],
+                    cwd=TARGET_ROOT,
+                )
+
+            create = run(
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    wt,
+                    base_commit,
+                ],
+                cwd=TARGET_ROOT,
+            )
 
     if create.returncode != 0:
         return {
             "task": task,
-            "status": "BLOCKED",
+            "status": "FAILED",
             "reason": "WORKTREE_CREATE_FAILED",
             "branch": branch,
             "worktree": str(wt),
@@ -283,27 +571,59 @@ def run_worker(run_id, task, base_commit):
             prompt,
         ],
         cwd=wt,
+        env={
+            "JEV_TELEMETRY_FILE": telemetry_path,
+            "JEV_RUN_ID": run_id,
+            "JEV_TASK_ID": tid,
+        },
     )
 
     if worker.returncode != 0:
-        return {
+        telemetry = load_worker_telemetry(telemetry_path)
+
+        worker_status = states.normalize(
+            telemetry.get("worker_status")
+        )
+
+        if worker_status in {
+            states.BLOCKED_RESOURCE,
+            states.BLOCKED_DEPENDENCY,
+            states.NEEDS_HUMAN,
+        }:
+            status = worker_status
+        else:
+            status = states.FAILED
+
+        result = {
             "task": task,
-            "status": "BLOCKED",
+            "status": status,
             "reason": f"WORKER_EXIT_{worker.returncode}",
             "branch": branch,
             "worktree": str(wt),
         }
 
-    status = output(["git", "status", "--porcelain"], cwd=wt)
+        result.update(telemetry)
+
+        # Canonical state wins over legacy telemetry.
+        result["status"] = status
+
+        return result
+
+    remove_generated_artifacts(wt)
+
+    status = output(
+        ["git", "status", "--porcelain"],
+        cwd=wt,
+    )
 
     if not status:
-        return {
+        return with_telemetry({
             "task": task,
-            "status": "BLOCKED",
+            "status": "FAILED",
             "reason": "NO_CHANGES_PRODUCED",
             "branch": branch,
             "worktree": str(wt),
-        }
+        }, telemetry_path)
 
     if status:
         run(["git", "add", "-A"], cwd=wt, check=True)
@@ -319,23 +639,23 @@ def run_worker(run_id, task, base_commit):
         )
 
         if commit.returncode != 0:
-            return {
+            return with_telemetry({
                 "task": task,
-                "status": "BLOCKED",
+                "status": "FAILED",
                 "reason": "COMMIT_FAILED",
                 "branch": branch,
                 "worktree": str(wt),
-            }
+            }, telemetry_path)
 
     commit_sha = output(["git", "rev-parse", "HEAD"], cwd=wt)
 
-    return {
+    return with_telemetry({
         "task": task,
         "status": "READY_TO_MERGE",
         "branch": branch,
         "commit": commit_sha,
         "worktree": str(wt),
-    }
+    }, telemetry_path)
 
 
 def merge_worker(result):
@@ -344,6 +664,32 @@ def merge_worker(result):
 
     print()
     print(f"========== MERGE GATE {tid} ==========")
+
+    dirty = run(
+        ["git", "status", "--porcelain"],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if dirty.returncode != 0:
+        result["status"] = "FAILED"
+        result["reason"] = "TARGET_STATUS_FAILED"
+        return False
+
+    if dirty.stdout.strip():
+        print("Target repository is dirty; refusing merge.")
+        print(dirty.stdout)
+
+        result["status"] = "FAILED"
+        result["reason"] = "TARGET_DIRTY_BEFORE_MERGE"
+        return False
+
+    pre_merge_head = output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=TARGET_ROOT,
+    )
+
+    result["pre_merge_head"] = pre_merge_head
 
     merged = run(
         [
@@ -394,6 +740,89 @@ def merge_worker(result):
     return True
 
 
+
+
+def cleanup_generated_artifacts(root):
+    import shutil
+
+    root = Path(root)
+
+    cache_dirs = {
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+
+    for path in root.rglob("*"):
+        if path.is_dir() and path.name in cache_dirs:
+            shutil.rmtree(path, ignore_errors=True)
+
+    for pattern in ("*.pyc", "*.pyo"):
+        for path in root.rglob(pattern):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def rollback_merged_worker(result):
+    pre_merge_head = result.get("pre_merge_head")
+
+    if not pre_merge_head:
+        result["rollback_status"] = "SKIPPED_NO_PRE_MERGE_HEAD"
+        return False
+
+    print()
+    print(
+        f"========== ROLLBACK {result['task']['id']} =========="
+    )
+    print(f"Restoring target HEAD -> {pre_merge_head}")
+
+    reset = run(
+        [
+            "git",
+            "reset",
+            "--hard",
+            pre_merge_head,
+        ],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if reset.returncode != 0:
+        print(reset.stdout)
+        print(reset.stderr)
+
+        result["rollback_status"] = "FAILED"
+        return False
+
+    # Verification or workers may leave generated artifacts behind.
+    # The target repository was required to be clean before merge, so these
+    # known cache artifacts were not part of the user's pre-merge state.
+    cleanup_generated_artifacts(TARGET_ROOT)
+
+    remaining = run(
+        ["git", "status", "--porcelain"],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if remaining.returncode != 0:
+        result["rollback_status"] = "FAILED_STATUS_CHECK"
+        return False
+
+    if remaining.stdout.strip():
+        print("Rollback restored HEAD but working tree is still dirty:")
+        print(remaining.stdout)
+
+        result["rollback_status"] = "FAILED_DIRTY_WORKTREE"
+        return False
+
+    result["rollback_status"] = "COMPLETED"
+    return True
+
+
 def cleanup_worker(result):
     wt = result.get("worktree")
     branch = result.get("branch")
@@ -409,6 +838,278 @@ def cleanup_worker(result):
             ["git", "branch", "-D", branch],
             cwd=TARGET_ROOT,
         )
+
+
+def save_run_state(
+    path,
+    *,
+    run_id,
+    original_task,
+    started_at,
+    results,
+    status,
+    plan_file=None,
+    reason=None,
+):
+    terminal = {
+        "COMPLETED",
+        "BLOCKED",
+        "FAILED",
+        "CONFLICTED",
+        "NEEDS_HUMAN",
+    }
+
+    payload = {
+        "version": 1,
+        "run_id": run_id,
+        "execution_shape": "DECOMPOSE",
+        "status": status,
+        "reason": reason,
+        "target_root": str(TARGET_ROOT),
+        "original_task": original_task,
+        "plan_file": str(plan_file) if plan_file else None,
+        "started_at": started_at,
+        "updated_at": time.time(),
+        "finished_at": time.time() if status in terminal else None,
+        "results": results,
+    }
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp.replace(path)
+
+
+
+def execute_task_waves(
+    run_id,
+    tasks,
+    *,
+    completed_ids=None,
+    max_workers=3,
+    on_update=None,
+):
+    """
+    Shared DAG executor used by both initial plans and post-resume replans.
+
+    Returns:
+        {
+            "status": "COMPLETED" | "BLOCKED" | "FAILED" | "CONFLICTED",
+            "reason": str | None,
+            "results": [...],
+        }
+    """
+    completed = set(completed_ids or [])
+    pending = {task["id"]: task for task in tasks}
+    task_ids = set(pending)
+
+    # Validate IDs.
+    if len(task_ids) != len(tasks):
+        raise RuntimeError("Duplicate task IDs")
+
+    # Validate dependencies. Dependencies may point either to another task
+    # in this execution or to an already-completed task from a previous run.
+    valid_dependencies = task_ids | completed
+
+    for task in tasks:
+        deps = set(task.get("depends_on", []))
+
+        unknown = deps - valid_dependencies
+        if unknown:
+            raise RuntimeError(
+                f'{task["id"]} has unknown dependencies: {unknown}'
+            )
+
+        if task["id"] in deps:
+            raise RuntimeError(
+                f'{task["id"]} depends on itself'
+            )
+
+    results = []
+
+    def notify(status="RUNNING", reason=None):
+        if on_update:
+            on_update(
+                results,
+                status=status,
+                reason=reason,
+            )
+
+    notify()
+
+    wave_index = 0
+
+    while pending:
+        wave_index += 1
+
+        ready_tasks = [
+            task
+            for task in pending.values()
+            if set(task.get("depends_on", [])).issubset(completed)
+        ]
+
+        if not ready_tasks:
+            raise RuntimeError(
+                "Dependency cycle or unresolved dependency detected"
+            )
+
+        print()
+        print("=====================================")
+        print(f" SHARED WAVE {wave_index}")
+        print("=====================================")
+
+        check_wave_file_overlap(ready_tasks)
+
+        base_commit = output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=TARGET_ROOT,
+        )
+
+        wave_results = []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max_workers, len(ready_tasks))
+        ) as pool:
+            futures = [
+                pool.submit(
+                    run_worker,
+                    run_id,
+                    task,
+                    base_commit,
+                )
+                for task in ready_tasks
+            ]
+
+            for future in futures:
+                wave_results.append(future.result())
+
+        results.extend(wave_results)
+        notify()
+
+        ready_to_merge = [
+            result
+            for result in wave_results
+            if result.get("status") == "READY_TO_MERGE"
+        ]
+
+        blocked = [
+            result
+            for result in wave_results
+            if states.is_blocked(result.get("status"))
+        ]
+
+        failed = [
+            result
+            for result in wave_results
+            if result.get("status") == states.FAILED
+        ]
+
+        if blocked:
+            print()
+            print("========== PARTIAL BLOCK ==========")
+
+            for result in blocked:
+                print(
+                    result["task"]["id"],
+                    result.get("status"),
+                    result.get("reason"),
+                    result.get("worktree"),
+                )
+
+        # Merge successful workers even when another independent worker
+        # in the same wave is blocked.
+        for result in ready_to_merge:
+            if not merge_worker(result):
+                notify(
+                    status="CONFLICTED",
+                    reason=result.get("reason") or "MERGE_CONFLICT",
+                )
+
+                return {
+                    "status": "CONFLICTED",
+                    "reason": result.get("reason") or "MERGE_CONFLICT",
+                    "results": results,
+                }
+
+            integration_verify = verify(TARGET_ROOT)
+
+            if integration_verify != "PASS":
+                result["status"] = "FAILED"
+                result["reason"] = (
+                    f"INTEGRATION_VERIFY_{integration_verify}"
+                )
+
+                rollback_ok = rollback_merged_worker(
+                    result
+                )
+
+                if not rollback_ok:
+                    result["reason"] += "_ROLLBACK_FAILED"
+
+                notify(
+                    status="FAILED",
+                    reason=result["reason"],
+                )
+
+                return {
+                    "status": "FAILED",
+                    "reason": result["reason"],
+                    "results": results,
+                }
+
+            cleanup_worker(result)
+
+            completed.add(result["task"]["id"])
+            pending.pop(result["task"]["id"], None)
+
+            notify()
+
+        if failed:
+            reason = (
+                failed[0].get("reason")
+                or "WAVE_WORKER_FAILED"
+            )
+
+            notify(
+                status=states.FAILED,
+                reason=reason,
+            )
+
+            return {
+                "status": states.FAILED,
+                "reason": reason,
+                "results": results,
+            }
+
+        if blocked:
+            blocked_status = states.normalize(
+                blocked[0].get("status")
+            )
+
+            if blocked_status not in {
+                states.BLOCKED_RESOURCE,
+                states.BLOCKED_DEPENDENCY,
+                states.NEEDS_HUMAN,
+            }:
+                blocked_status = states.BLOCKED_RESOURCE
+
+            notify(
+                status=blocked_status,
+                reason="WAVE_PARTIALLY_BLOCKED",
+            )
+
+            return {
+                "status": blocked_status,
+                "reason": "WAVE_PARTIALLY_BLOCKED",
+                "results": results,
+            }
+
+    notify(status="COMPLETED")
+
+    return {
+        "status": "COMPLETED",
+        "reason": None,
+        "results": results,
+    }
 
 
 def main():
@@ -444,7 +1145,9 @@ def main():
         )
 
     run_id = time.strftime("%Y%m%d-%H%M%S")
+    started_at = time.time()
     plan_file = STATE_ROOT / f"plan-{run_id}.json"
+    run_state_file = STATE_ROOT / f"run-{run_id}.json"
 
     print()
     print("=====================================")
@@ -457,104 +1160,73 @@ def main():
     print()
     print(json.dumps(plan, indent=2))
 
-    waves = calculate_waves(plan["tasks"])
-
     all_results = []
 
-    for wave_index, wave in enumerate(waves, 1):
-        print()
-        print("=====================================")
-        print(f" WAVE {wave_index}")
-        print("=====================================")
+    def update_factory_state(
+        current_results,
+        *,
+        status="RUNNING",
+        reason=None,
+    ):
+        nonlocal all_results
 
-        check_wave_file_overlap(wave)
+        all_results = current_results
 
-        base_commit = output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=TARGET_ROOT,
+        save_run_state(
+            run_state_file,
+            run_id=run_id,
+            original_task=task,
+            started_at=started_at,
+            results=all_results,
+            status=status,
+            plan_file=plan_file,
+            reason=reason,
         )
 
-        results = []
+    outcome = execute_task_waves(
+        run_id,
+        plan["tasks"],
+        on_update=update_factory_state,
+    )
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(3, len(wave))
-        ) as pool:
-            futures = [
-                pool.submit(
-                    run_worker,
-                    run_id,
-                    task_item,
-                    base_commit,
-                )
-                for task_item in wave
-            ]
+    all_results = outcome["results"]
 
-            for f in futures:
-                results.append(f.result())
+    if outcome["status"] != "COMPLETED":
+        legacy_prefix = {
+            "BLOCKED_RESOURCE": "blocked",
+            "BLOCKED_DEPENDENCY": "blocked",
+            "NEEDS_HUMAN": "blocked",
+            "BLOCKED": "blocked",
+            "CONFLICTED": "conflict",
+            "FAILED": "verify-fail",
+        }.get(outcome["status"], "blocked")
 
-        all_results.extend(results)
+        state_file = (
+            STATE_ROOT
+            / f"{legacy_prefix}-{run_id}.json"
+        )
 
-        ready = [
-            r for r in results
-            if r["status"] == "READY_TO_MERGE"
-        ]
+        state_file.write_text(
+            json.dumps(all_results, indent=2) + "\n"
+        )
 
-        blocked = [
-            r for r in results
-            if r["status"] != "READY_TO_MERGE"
-        ]
+        print()
+        print("=====================================")
+        print(f" FACTORY {outcome['status']}")
+        print("=====================================")
+        print("Reason:", outcome.get("reason"))
+        print("State :", run_state_file)
 
-        if blocked:
-            print()
-            print("========== PARTIAL BLOCK ==========")
+        exit_code = {
+            "BLOCKED_RESOURCE": 2,
+            "BLOCKED_DEPENDENCY": 2,
+            "NEEDS_HUMAN": 2,
+            "BLOCKED": 2,
+            "CONFLICTED": 3,
+            "FAILED": 4,
+        }.get(outcome["status"], 2)
 
-            for r in blocked:
-                print(
-                    r["task"]["id"],
-                    r["status"],
-                    r.get("reason"),
-                    r.get("worktree"),
-                )
-
-        for result in ready:
-            if not merge_worker(result):
-                state_file = STATE_ROOT / f"conflict-{run_id}.json"
-                state_file.write_text(json.dumps(all_results, indent=2))
-
-                print()
-                print("Integration conflict.")
-                print(f"State saved: {state_file}")
-                print(
-                    f'Worktree preserved: {result["worktree"]}'
-                )
-                raise SystemExit(3)
-
-            if verify(TARGET_ROOT) != "PASS":
-                print()
-                print(
-                    f'Integration verification failed after '
-                    f'{result["task"]["id"]}.'
-                )
-
-                state_file = STATE_ROOT / f"verify-fail-{run_id}.json"
-                state_file.write_text(json.dumps(all_results, indent=2))
-                raise SystemExit(4)
-
-            cleanup_worker(result)
-
-        if blocked:
-            state_file = STATE_ROOT / f"blocked-{run_id}.json"
-            state_file.write_text(json.dumps(all_results, indent=2))
-
-            print()
-            print("=====================================")
-            print(" WAVE PARTIALLY COMPLETE")
-            print("=====================================")
-            print(f"Merged tasks: {len(ready)}")
-            print(f"Blocked tasks: {len(blocked)}")
-            print(f"State saved: {state_file}")
-            print("Blocked worktrees are preserved for debugging/resume.")
-            raise SystemExit(2)
+        raise SystemExit(exit_code)
 
     print()
     print("=====================================")
@@ -562,13 +1234,34 @@ def main():
     print("=====================================")
 
     if verify(TARGET_ROOT) != "PASS":
+        save_run_state(
+            run_state_file,
+            run_id=run_id,
+            original_task=task,
+            started_at=started_at,
+            results=all_results,
+            status="FAILED",
+            plan_file=plan_file,
+            reason="FINAL_VERIFY_FAILED",
+        )
         raise SystemExit("Final verification failed.")
+
+    save_run_state(
+        run_state_file,
+        run_id=run_id,
+        original_task=task,
+        started_at=started_at,
+        results=all_results,
+        status="COMPLETED",
+        plan_file=plan_file,
+    )
 
     print()
     print("=====================================")
     print(" FACTORY COMPLETE")
     print("=====================================")
-    print(f"Plan: {plan_file}")
+    print(f"Plan : {plan_file}")
+    print(f"State: {run_state_file}")
     print(f"Tasks completed: {len(all_results)}")
 
 

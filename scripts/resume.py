@@ -6,21 +6,33 @@ import subprocess
 import sys
 from pathlib import Path
 
+import factory
+import states
+
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
 STATE_ROOT = ENGINE_ROOT / "state"
 TARGET_ROOT = Path.cwd().resolve()
 
 
-def run(cmd, cwd=None, capture=False):
+def run(cmd, cwd=None, capture=False, env=None):
     cmd = [str(x) for x in cmd]
     print("+", " ".join(cmd))
+
+    merged_env = os.environ.copy()
+
+    if env:
+        merged_env.update({
+            str(k): str(v)
+            for k, v in env.items()
+        })
 
     return subprocess.run(
         cmd,
         cwd=cwd,
         text=True,
         capture_output=capture,
+        env=merged_env,
     )
 
 
@@ -114,7 +126,245 @@ def resolve_state(arg=None):
 
 
 def save_state(path, data):
-    path.write_text(json.dumps(data, indent=2))
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def extract_results(data):
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return data["results"]
+
+    raise SystemExit("Unsupported state format.")
+
+
+def infer_run_id(path, data):
+    if isinstance(data, dict) and data.get("run_id"):
+        return str(data["run_id"])
+
+    stem = path.stem
+
+    for prefix in (
+        "blocked-",
+        "conflict-",
+        "verify-fail-",
+        "run-",
+    ):
+        if stem.startswith(prefix):
+            return stem[len(prefix):]
+
+    return None
+
+
+def resolve_canonical_state(state_file, data):
+    run_id = infer_run_id(state_file, data)
+
+    if not run_id:
+        return None
+
+    candidate = STATE_ROOT / f"run-{run_id}.json"
+
+    if candidate.exists():
+        return candidate
+
+    return None
+
+
+def update_run_state(
+    canonical_path,
+    results,
+    *,
+    status=None,
+    reason=None,
+):
+    if canonical_path is None or not canonical_path.exists():
+        return
+
+    data = json.loads(canonical_path.read_text())
+
+    if not isinstance(data, dict):
+        return
+
+    data["results"] = results
+
+    if status is not None:
+        data["status"] = status
+
+    data["reason"] = reason
+
+    import time
+    data["updated_at"] = time.time()
+
+    if status in {
+        "COMPLETED",
+        "BLOCKED",
+        "FAILED",
+        "CONFLICTED",
+        "NEEDS_HUMAN",
+    }:
+        data["finished_at"] = time.time()
+
+    save_state(canonical_path, data)
+
+
+
+def replan_after_resume(run_state):
+    original_task = run_state.get("original_task")
+
+    if not original_task:
+        return {
+            "goal_complete": True,
+            "summary": "No original goal is available for replanning.",
+            "shared_integration_files": [],
+            "tasks": [],
+        }
+
+    completed = []
+
+    for result in run_state.get("results", []):
+        if result.get("status") not in {
+            "MERGED",
+            "COMPLETED",
+        }:
+            continue
+
+        task = result.get("task", {})
+
+        completed.append({
+            "id": task.get("id"),
+            "title": task.get("title"),
+            "acceptance": task.get("acceptance", []),
+            "status": result.get("status"),
+        })
+
+    run_id = str(run_state.get("run_id") or "resume")
+    replan_file = STATE_ROOT / f"replan-{run_id}.json"
+
+    completed_json = json.dumps(
+        completed,
+        indent=2,
+    )
+
+    prompt = f"""
+You are the parent software-engineering orchestrator performing a
+post-resume completion check.
+
+ORIGINAL USER GOAL:
+{original_task}
+
+TASKS ALREADY COMPLETED OR MERGED:
+{completed_json}
+
+The repository has changed since the original plan. Inspect the CURRENT
+repository state before deciding anything.
+
+Determine whether the ORIGINAL USER GOAL is now fully satisfied.
+
+Important rules:
+- Judge completion against the original user goal, not merely the old plan.
+- Previously blocked prerequisites may now exist.
+- Do not recreate work that is already complete.
+- Do not create a task merely to restore a prerequisite if that prerequisite
+  already exists in the repository.
+- If implementation work remains after a prerequisite was restored, create
+  the implementation task.
+- Create only the smallest remaining substantive tasks.
+- A single remaining task is valid.
+- Zero remaining tasks is valid.
+- Parallel tasks must not own overlapping files.
+- Do not modify the repository.
+- Do not implement anything.
+- Never search above the repository root.
+- Restrict inspection to the current repository.
+- Ignore .git, .venv, node_modules, build directories, caches and generated
+  artifacts unless directly relevant.
+
+Set goal_complete=true only when the current repository already satisfies
+the original user goal.
+
+If goal_complete=true, tasks MUST be empty.
+
+Return only the requested structured result.
+"""
+
+    cmd = [
+        "codex",
+        "exec",
+        "-s",
+        "read-only",
+        "-m",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="medium"',
+        "-C",
+        TARGET_ROOT,
+        "--output-schema",
+        ENGINE_ROOT / "schemas" / "replan.schema.json",
+        "-o",
+        replan_file,
+        prompt,
+    ]
+
+    r = run(cmd, cwd=TARGET_ROOT)
+
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"Replan failed with exit code {r.returncode}"
+        )
+
+    result = json.loads(replan_file.read_text())
+
+    if result["goal_complete"] and result["tasks"]:
+        raise RuntimeError(
+            "Invalid replan: goal_complete=true but tasks are present."
+        )
+
+    if not result["goal_complete"] and not result["tasks"]:
+        raise RuntimeError(
+            "Invalid replan: goal incomplete but no remaining tasks."
+        )
+
+    print()
+    print("=====================================")
+    print(" POST-RESUME REPLAN")
+    print("=====================================")
+    print(json.dumps(result, indent=2))
+
+    return result
+
+
+
+
+def execute_replan_tasks(run_state, replan):
+    tasks = replan.get("tasks", [])
+
+    if not tasks:
+        return []
+
+    run_id = str(run_state.get("run_id") or "resume")
+
+    print()
+    print("=====================================")
+    print(" EXECUTE REPLAN TASKS")
+    print("=====================================")
+
+    completed_ids = {
+        result.get("task", {}).get("id")
+        for result in run_state.get("results", [])
+        if result.get("status") in {
+            "MERGED",
+            "COMPLETED",
+        }
+    }
+
+    outcome = factory.execute_task_waves(
+        run_id,
+        tasks,
+        completed_ids=completed_ids,
+    )
+
+    return outcome["results"]
 
 
 def main():
@@ -139,20 +389,100 @@ def main():
         )
 
     data = json.loads(state_file.read_text())
+    results = extract_results(data)
 
-    if not isinstance(data, list):
-        raise SystemExit("Unsupported state format.")
+    canonical_state = resolve_canonical_state(
+        state_file,
+        data,
+    )
 
     blocked = [
-        r for r in data
-        if r.get("status") in {
-            "BLOCKED",
-            "CONFLICTED",
-        }
+        r for r in results
+        if (
+            states.is_blocked(r.get("status"))
+            or r.get("status") == states.CONFLICTED
+        )
     ]
 
     if not blocked:
         print("No blocked tasks remain.")
+
+        if canonical_state is None or not canonical_state.exists():
+            return
+
+        canonical_data = json.loads(
+            canonical_state.read_text()
+        )
+
+        replan = replan_after_resume(
+            canonical_data
+        )
+
+        if replan["goal_complete"]:
+            update_run_state(
+                canonical_state,
+                results,
+                status="COMPLETED",
+                reason=None,
+            )
+
+            print()
+            print("Original goal is already complete.")
+            return
+
+        new_results = execute_replan_tasks(
+            canonical_data,
+            replan,
+        )
+
+        results.extend(new_results)
+
+        failed_replan = [
+            r for r in new_results
+            if r.get("status") != "MERGED"
+        ]
+
+        if failed_replan:
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason="REPLAN_TASK_FAILED",
+            )
+
+            raise SystemExit(2)
+
+        final_after_replan = verify(
+            TARGET_ROOT
+        )
+
+        if final_after_replan != "PASS":
+            update_run_state(
+                canonical_state,
+                results,
+                status="FAILED",
+                reason=(
+                    "POST_REPLAN_FINAL_VERIFY_"
+                    f"{final_after_replan}"
+                ),
+            )
+
+            raise SystemExit(
+                f"Post-replan final verification: "
+                f"{final_after_replan}"
+            )
+
+        update_run_state(
+            canonical_state,
+            results,
+            status="COMPLETED",
+            reason=None,
+        )
+
+        print()
+        print("=====================================")
+        print(" REPLAN COMPLETE")
+        print("=====================================")
         return
 
     print()
@@ -179,6 +509,13 @@ def main():
             result["status"] = "BLOCKED"
             result["reason"] = "WORKTREE_MISSING"
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
             print("Blocked worktree no longer exists:", wt)
             continue
 
@@ -206,6 +543,13 @@ def main():
             result["reason"] = "RESUME_SYNC_CONFLICT"
             save_state(state_file, data)
 
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
+
             print()
             print("Resume sync conflict.")
             print("Worktree preserved:", wt)
@@ -213,18 +557,45 @@ def main():
 
         prompt = worker_prompt(task)
 
+        resume_run_id = infer_run_id(state_file, data) or "resume"
+
+        telemetry_dir = STATE_ROOT / "workers" / resume_run_id
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+
+        telemetry_path = telemetry_dir / f"{tid}.json"
+
         worker = run(
             [
                 ENGINE_ROOT / "scripts" / "run.sh",
                 prompt,
             ],
             cwd=wt,
+            env={
+                "JEV_TELEMETRY_FILE": telemetry_path,
+                "JEV_RUN_ID": resume_run_id,
+                "JEV_TASK_ID": tid,
+            },
         )
+
+        if telemetry_path.exists():
+            try:
+                result.update(
+                    json.loads(telemetry_path.read_text())
+                )
+            except Exception as exc:
+                print("Warning: resume telemetry read failed:", exc)
 
         if worker.returncode != 0:
             result["status"] = "BLOCKED"
             result["reason"] = f"WORKER_EXIT_{worker.returncode}"
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
 
             print()
             print("Task remains blocked:", tid)
@@ -235,6 +606,74 @@ def main():
             ["git", "status", "--porcelain"],
             cwd=wt,
         )
+
+        if not status:
+            print()
+            print(
+                f"Resume task {tid} is already satisfied "
+                "after synchronization; no worker changes required."
+            )
+
+            final_check = verify(TARGET_ROOT)
+
+            if final_check != "PASS":
+                result["status"] = "BLOCKED"
+                result["reason"] = (
+                    f"RESUME_NO_CHANGE_VERIFY_{final_check}"
+                )
+
+                save_state(state_file, data)
+
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="BLOCKED",
+                    reason=result["reason"],
+                )
+                continue
+
+            target_head = output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=TARGET_ROOT,
+            )
+
+            result["status"] = "MERGED"
+            result["reason"] = None
+            result["commit"] = target_head
+            result["verify_result"] = "PASS"
+
+            save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="RUNNING",
+                reason=None,
+            )
+
+            run(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    wt,
+                ],
+                cwd=TARGET_ROOT,
+            )
+
+            run(
+                [
+                    "git",
+                    "branch",
+                    "-D",
+                    branch,
+                ],
+                cwd=TARGET_ROOT,
+            )
+
+            print("RESUMED + SATISFIED:", tid)
+            continue
 
         if status:
             run(["git", "add", "-A"], cwd=wt)
@@ -253,6 +692,13 @@ def main():
                 result["status"] = "BLOCKED"
                 result["reason"] = "RESUME_COMMIT_FAILED"
                 save_state(state_file, data)
+
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="BLOCKED",
+                    reason=result.get("reason"),
+                )
                 continue
 
         worker_head = output(
@@ -283,6 +729,13 @@ def main():
             result["status"] = "CONFLICTED"
             result["reason"] = "RESUME_MERGE_CONFLICT"
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="CONFLICTED",
+                reason=result.get("reason"),
+            )
             continue
 
         verify_result = verify(TARGET_ROOT)
@@ -300,6 +753,13 @@ def main():
                 f"RESUME_VERIFY_{verify_result}"
             )
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
             continue
 
         commit = run(
@@ -321,6 +781,13 @@ def main():
             result["status"] = "BLOCKED"
             result["reason"] = "RESUME_MERGE_COMMIT_FAILED"
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
             continue
 
         result["status"] = "MERGED"
@@ -328,6 +795,13 @@ def main():
         result["commit"] = worker_head
 
         save_state(state_file, data)
+
+        update_run_state(
+            canonical_state,
+            results,
+            status="RUNNING",
+            reason=None,
+        )
 
         run(
             [
@@ -354,11 +828,11 @@ def main():
         print("RESUMED + MERGED:", tid)
 
     remaining = [
-        r for r in data
-        if r.get("status") in {
-            "BLOCKED",
-            "CONFLICTED",
-        }
+        r for r in results
+        if (
+            states.is_blocked(r.get("status"))
+            or r.get("status") == states.CONFLICTED
+        )
     ]
 
     print()
@@ -377,6 +851,13 @@ def main():
                 r.get("worktree"),
             )
 
+        update_run_state(
+            canonical_state,
+            results,
+            status="BLOCKED",
+            reason="RESUME_PARTIALLY_BLOCKED",
+        )
+
         raise SystemExit(2)
 
     print(" FINAL VERIFY")
@@ -385,9 +866,75 @@ def main():
     final = verify(TARGET_ROOT)
 
     if final != "PASS":
+        update_run_state(
+            canonical_state,
+            results,
+            status="FAILED",
+            reason=f"FINAL_VERIFY_{final}",
+        )
+
         raise SystemExit(
             f"Final verification: {final}"
         )
+
+    if canonical_state is not None and canonical_state.exists():
+        canonical_data = json.loads(
+            canonical_state.read_text()
+        )
+
+        replan = replan_after_resume(
+            canonical_data
+        )
+
+        if not replan["goal_complete"]:
+            new_results = execute_replan_tasks(
+                canonical_data,
+                replan,
+            )
+
+            results.extend(new_results)
+
+            failed_replan = [
+                r for r in new_results
+                if r.get("status") != "MERGED"
+            ]
+
+            if failed_replan:
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="BLOCKED",
+                    reason="REPLAN_TASK_FAILED",
+                )
+
+                raise SystemExit(2)
+
+            final_after_replan = verify(
+                TARGET_ROOT
+            )
+
+            if final_after_replan != "PASS":
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="FAILED",
+                    reason=(
+                        "POST_REPLAN_FINAL_VERIFY_"
+                        f"{final_after_replan}"
+                    ),
+                )
+
+                raise SystemExit(
+                    f"Post-replan final verification: "
+                    f"{final_after_replan}"
+                )
+
+    update_run_state(
+        canonical_state,
+        results,
+        status="COMPLETED",
+        reason=None,
+    )
 
     print()
     print("=====================================")

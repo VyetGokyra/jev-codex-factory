@@ -44,6 +44,75 @@ print(x["confidence"])
 ' <<< "$RESULT"
 )"
 
+ROUTE_DECISION="$DECISION"
+
+write_telemetry() {
+    local status="${1:-UNKNOWN}"
+    local verify_result="${2:-NOT_RUN}"
+    local codex_exit="${3:-}"
+    local attempts="${4:-0}"
+
+    [ -z "${JEV_TELEMETRY_FILE:-}" ] && return 0
+
+    mkdir -p "$(dirname "$JEV_TELEMETRY_FILE")"
+
+    TELEMETRY_STATUS="$status" \
+    TELEMETRY_VERIFY="$verify_result" \
+    TELEMETRY_CODEX_EXIT="$codex_exit" \
+    TELEMETRY_ATTEMPTS="$attempts" \
+    TELEMETRY_ROUTE_DECISION="${ROUTE_DECISION:-}" \
+    TELEMETRY_WORKER="${WORKER:-${DECISION:-}}" \
+    TELEMETRY_MODEL="${MODEL:-}" \
+    TELEMETRY_EFFORT="${EFFORT:-}" \
+    TELEMETRY_CONFIDENCE="${CONFIDENCE:-}" \
+    TELEMETRY_RUN_ID="${JEV_RUN_ID:-}" \
+    TELEMETRY_TASK_ID="${JEV_TASK_ID:-}" \
+    python - "$JEV_TELEMETRY_FILE" <<'PYTELEMETRY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+
+def maybe_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+def maybe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+data = {
+    "run_id": os.environ.get("TELEMETRY_RUN_ID") or None,
+    "task_id": os.environ.get("TELEMETRY_TASK_ID") or None,
+    "route_decision": os.environ.get("TELEMETRY_ROUTE_DECISION") or None,
+    "worker": os.environ.get("TELEMETRY_WORKER") or None,
+    "model": os.environ.get("TELEMETRY_MODEL") or None,
+    "effort": os.environ.get("TELEMETRY_EFFORT") or None,
+    "jev_confidence": maybe_float(
+        os.environ.get("TELEMETRY_CONFIDENCE")
+    ),
+    "attempts": maybe_int(
+        os.environ.get("TELEMETRY_ATTEMPTS")
+    ),
+    "codex_exit": maybe_int(
+        os.environ.get("TELEMETRY_CODEX_EXIT")
+    ),
+    "verify_result": os.environ.get("TELEMETRY_VERIFY") or None,
+    "worker_status": os.environ.get("TELEMETRY_STATUS") or None,
+}
+
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text(json.dumps(data, indent=2) + "\n")
+tmp.replace(path)
+PYTELEMETRY
+}
+
 echo
 echo "Decision   : $DECISION"
 echo "Confidence : $CONFIDENCE"
@@ -60,6 +129,7 @@ if [ "$LOW_CONF" = "yes" ]; then
 
     if [ "$DECISION" = "STOP_AND_REPORT" ]; then
         echo "STOP_AND_REPORT"
+        write_telemetry "BLOCKED_RESOURCE" "NOT_RUN" "" "0"
         exit 2
     fi
 
@@ -129,16 +199,17 @@ run_verify() {
     echo " VERIFY: $TARGET_ROOT"
     echo "====================================="
 
-    set +e
+    local verify_exit
+
     if [ -x "$TARGET_ROOT/scripts/verify.sh" ]; then
         (cd "$TARGET_ROOT" && ./scripts/verify.sh) | tee "$ENGINE_ROOT/logs/verify_last.log"
+        verify_exit=${PIPESTATUS[0]}
     else
         (cd "$TARGET_ROOT" && "$ENGINE_ROOT/scripts/verify.sh") | tee "$ENGINE_ROOT/logs/verify_last.log"
+        verify_exit=${PIPESTATUS[0]}
     fi
-    VERIFY_EXIT=${PIPESTATUS[0]}
-    set -e
 
-    return "$VERIFY_EXIT"
+    return "$verify_exit"
 }
 
 case "$DECISION" in
@@ -147,19 +218,28 @@ case "$DECISION" in
         ;;
 
     VERIFY_ONLY)
+        WORKER="VERIFY_ONLY"
+        MODEL=""
+        EFFORT=""
+
         if run_verify; then
             echo
             echo "DONE: verification passed."
+            write_telemetry "COMPLETED" "PASS" "" "0"
             exit 0
         else
+            VERIFY_EXIT=$?
             echo
             echo "Verification failed."
-            exit 1
+            write_telemetry "FAILED" "FAIL" "" "0"
+            exit "$VERIFY_EXIT"
         fi
         ;;
 
     STOP_AND_REPORT)
+        WORKER="STOP_AND_REPORT"
         echo "Jev requested STOP_AND_REPORT."
+        write_telemetry "BLOCKED_RESOURCE" "NOT_RUN" "" "0"
         exit 2
         ;;
 
@@ -169,8 +249,51 @@ case "$DECISION" in
         ;;
 esac
 
+next_higher_effort_lane() {
+    case "$1" in
+        LUNA_LOW)
+            echo "LUNA_HIGH"
+            ;;
+        SOL_MEDIUM)
+            echo "SOL_HIGH"
+            ;;
+        SOL_HIGH)
+            echo "SOL_XHIGH"
+            ;;
+        *)
+            echo "$1"
+            ;;
+    esac
+}
+
+next_stronger_model_lane() {
+    case "$1" in
+        LUNA_LOW|LUNA_HIGH)
+            echo "TERRA_HIGH"
+            ;;
+        TERRA_HIGH)
+            echo "SOL_MEDIUM"
+            ;;
+        SOL_MEDIUM)
+            echo "SOL_HIGH"
+            ;;
+        SOL_HIGH)
+            echo "SOL_XHIGH"
+            ;;
+        SOL_XHIGH)
+            echo "ASTRA_HIGH"
+            ;;
+        ASTRA_HIGH)
+            echo "ASTRA_HIGH"
+            ;;
+        *)
+            echo "SOL_MEDIUM"
+            ;;
+    esac
+}
+
 ATTEMPTS=0
-MAX_ATTEMPTS=2
+MAX_ATTEMPTS=3
 
 while true; do
     ATTEMPTS=$((ATTEMPTS + 1))
@@ -183,7 +306,12 @@ while true; do
     echo
     echo "Codex exit code: $CODEX_EXIT"
 
-    if run_verify; then
+    set +e
+    run_verify
+    VERIFY_EXIT=$?
+    set -e
+
+    if [ "$VERIFY_EXIT" -eq 0 ]; then
         echo
         echo "====================================="
         echo " DONE"
@@ -191,19 +319,18 @@ while true; do
         echo "Worker   : $WORKER"
         echo "Attempts : $ATTEMPTS"
         echo "Verify   : PASS"
+        write_telemetry "COMPLETED" "PASS" "$CODEX_EXIT" "$ATTEMPTS"
         exit 0
     fi
 
-    VERIFY_EXIT=$?
+    if [ "$VERIFY_EXIT" -eq 2 ]; then
+        VERIFY_RESULT="INCONCLUSIVE"
+    else
+        VERIFY_RESULT="FAIL"
+    fi
 
     echo
     echo "Verification failed with exit code: $VERIFY_EXIT"
-
-    if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
-        echo "Maximum repair attempts reached."
-        echo "STOP_AND_REPORT"
-        exit 2
-    fi
 
     echo
     echo "====================================="
@@ -249,26 +376,93 @@ print("yes" if float(sys.argv[1]) < 0.60 else "no")
 
     if [ "$LOW_POST_CONF" = "yes" ]; then
         echo "Post-run Jev confidence < 0.60"
-        echo "STOP_AND_REPORT"
+        echo "NEEDS_HUMAN"
+
+        write_telemetry             "NEEDS_HUMAN"             "$VERIFY_RESULT"             "$CODEX_EXIT"             "$ATTEMPTS"
+
         exit 2
     fi
 
     case "$POST_DECISION" in
-        RETRY_LUNA)
-            WORKER="LUNA"
+        RETRY_SAME)
+            if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+                echo "Maximum attempts reached; retry denied."
+                write_telemetry                     "FAILED"                     "$VERIFY_RESULT"                     "$CODEX_EXIT"                     "$ATTEMPTS"
+                exit 2
+            fi
+
+            echo "Retrying same lane: $WORKER"
             ;;
 
-        ESCALATE_SOL)
-            WORKER="SOL"
+        RETRY_HIGHER_EFFORT)
+            if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+                echo "Maximum attempts reached; RETRY_HIGHER_EFFORT denied."
+                write_telemetry \
+                    "FAILED" \
+                    "$VERIFY_RESULT" \
+                    "$CODEX_EXIT" \
+                    "$ATTEMPTS"
+                exit 2
+            fi
+            OLD_WORKER="$WORKER"
+            WORKER="$(next_higher_effort_lane "$WORKER")"
+
+            echo "Higher-effort retry:"
+            echo "  $OLD_WORKER -> $WORKER"
+
+            if [ "$WORKER" = "$OLD_WORKER" ]; then
+                echo "No higher-effort lane available."
+            fi
             ;;
 
-        STOP_AND_REPORT)
-            echo "Jev requested STOP_AND_REPORT."
+        ESCALATE_MODEL)
+            if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+                echo "Maximum attempts reached; ESCALATE_MODEL denied."
+                write_telemetry \
+                    "FAILED" \
+                    "$VERIFY_RESULT" \
+                    "$CODEX_EXIT" \
+                    "$ATTEMPTS"
+                exit 2
+            fi
+            OLD_WORKER="$WORKER"
+            WORKER="$(next_stronger_model_lane "$WORKER")"
+
+            echo "Model escalation:"
+            echo "  $OLD_WORKER -> $WORKER"
+
+            if [ "$WORKER" = "$OLD_WORKER" ]; then
+                echo "Already at strongest available lane."
+            fi
+            ;;
+
+        BLOCKED_RESOURCE)
+            echo "Jev classified failure as BLOCKED_RESOURCE."
+            write_telemetry                 "BLOCKED_RESOURCE"                 "$VERIFY_RESULT"                 "$CODEX_EXIT"                 "$ATTEMPTS"
+            exit 2
+            ;;
+
+        BLOCKED_DEPENDENCY)
+            echo "Jev classified failure as BLOCKED_DEPENDENCY."
+            write_telemetry                 "BLOCKED_DEPENDENCY"                 "$VERIFY_RESULT"                 "$CODEX_EXIT"                 "$ATTEMPTS"
+            exit 2
+            ;;
+
+        NEEDS_HUMAN)
+            echo "Jev classified failure as NEEDS_HUMAN."
+            write_telemetry                 "NEEDS_HUMAN"                 "$VERIFY_RESULT"                 "$CODEX_EXIT"                 "$ATTEMPTS"
+            exit 2
+            ;;
+
+        STOP)
+            echo "Jev requested autonomous stop."
+            write_telemetry                 "FAILED"                 "$VERIFY_RESULT"                 "$CODEX_EXIT"                 "$ATTEMPTS"
             exit 2
             ;;
 
         *)
             echo "Unknown post-run decision: $POST_DECISION"
+            write_telemetry                 "FAILED"                 "$VERIFY_RESULT"                 "$CODEX_EXIT"                 "$ATTEMPTS"
             exit 3
             ;;
     esac
