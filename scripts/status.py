@@ -108,6 +108,12 @@ def main():
     if state.get("target_root"):
         print("Target:", state["target_root"])
 
+    if state.get("execution_shape"):
+        print("Shape :", state["execution_shape"])
+
+    if state.get("status"):
+        print("Status:", state["status"])
+
     print()
     print(
         f"{'':2} "

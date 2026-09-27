@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +20,10 @@ LOG_ROOT = ENGINE_ROOT / "logs"
 
 STATE_ROOT.mkdir(exist_ok=True)
 LOG_ROOT.mkdir(exist_ok=True)
+
+# Git worktree/ref creation mutates shared repository metadata.
+# Serialize only this short critical section; workers still execute in parallel.
+GIT_WORKTREE_LOCK = threading.Lock()
 
 
 def run(cmd, cwd=None, capture=False, check=False, env=None):
@@ -352,18 +357,68 @@ def run_worker(run_id, task, base_commit):
     if wt.exists():
         shutil.rmtree(wt)
 
-    create = run(
-        [
-            "git",
-            "worktree",
-            "add",
-            "-b",
-            branch,
-            wt,
-            base_commit,
-        ],
-        cwd=TARGET_ROOT,
-    )
+    with GIT_WORKTREE_LOCK:
+        # Clear stale administrative entries before creating a new worktree.
+        run(
+            ["git", "worktree", "prune"],
+            cwd=TARGET_ROOT,
+        )
+
+        create = run(
+            [
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                wt,
+                base_commit,
+            ],
+            cwd=TARGET_ROOT,
+        )
+
+    if create.returncode != 0:
+        print(f"Retrying worktree creation for {tid}...")
+
+        time.sleep(0.25)
+
+        with GIT_WORKTREE_LOCK:
+            run(
+                ["git", "worktree", "prune"],
+                cwd=TARGET_ROOT,
+            )
+
+            # Remove a partially-created branch only if it exists and
+            # is not checked out anywhere.
+            branch_exists = subprocess.run(
+                [
+                    "git",
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                ],
+                cwd=TARGET_ROOT,
+            ).returncode == 0
+
+            if branch_exists:
+                subprocess.run(
+                    ["git", "branch", "-D", branch],
+                    cwd=TARGET_ROOT,
+                )
+
+            create = run(
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    wt,
+                    base_commit,
+                ],
+                cwd=TARGET_ROOT,
+            )
 
     if create.returncode != 0:
         return {
@@ -515,6 +570,45 @@ def cleanup_worker(result):
         )
 
 
+def save_run_state(
+    path,
+    *,
+    run_id,
+    original_task,
+    started_at,
+    results,
+    status,
+    plan_file=None,
+    reason=None,
+):
+    terminal = {
+        "COMPLETED",
+        "BLOCKED",
+        "FAILED",
+        "CONFLICTED",
+        "NEEDS_HUMAN",
+    }
+
+    payload = {
+        "version": 1,
+        "run_id": run_id,
+        "execution_shape": "DECOMPOSE",
+        "status": status,
+        "reason": reason,
+        "target_root": str(TARGET_ROOT),
+        "original_task": original_task,
+        "plan_file": str(plan_file) if plan_file else None,
+        "started_at": started_at,
+        "updated_at": time.time(),
+        "finished_at": time.time() if status in terminal else None,
+        "results": results,
+    }
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp.replace(path)
+
+
 def main():
     if len(sys.argv) < 2:
         raise SystemExit('usage: jfactory "large task"')
@@ -548,7 +642,9 @@ def main():
         )
 
     run_id = time.strftime("%Y%m%d-%H%M%S")
+    started_at = time.time()
     plan_file = STATE_ROOT / f"plan-{run_id}.json"
+    run_state_file = STATE_ROOT / f"run-{run_id}.json"
 
     print()
     print("=====================================")
@@ -564,6 +660,16 @@ def main():
     waves = calculate_waves(plan["tasks"])
 
     all_results = []
+
+    save_run_state(
+        run_state_file,
+        run_id=run_id,
+        original_task=task,
+        started_at=started_at,
+        results=all_results,
+        status="RUNNING",
+        plan_file=plan_file,
+    )
 
     for wave_index, wave in enumerate(waves, 1):
         print()
@@ -598,6 +704,16 @@ def main():
 
         all_results.extend(results)
 
+        save_run_state(
+            run_state_file,
+            run_id=run_id,
+            original_task=task,
+            started_at=started_at,
+            results=all_results,
+            status="RUNNING",
+            plan_file=plan_file,
+        )
+
         ready = [
             r for r in results
             if r["status"] == "READY_TO_MERGE"
@@ -622,6 +738,17 @@ def main():
 
         for result in ready:
             if not merge_worker(result):
+                save_run_state(
+                    run_state_file,
+                    run_id=run_id,
+                    original_task=task,
+                    started_at=started_at,
+                    results=all_results,
+                    status="CONFLICTED",
+                    plan_file=plan_file,
+                    reason="MERGE_CONFLICT",
+                )
+
                 state_file = STATE_ROOT / f"conflict-{run_id}.json"
                 state_file.write_text(json.dumps(all_results, indent=2))
 
@@ -634,6 +761,20 @@ def main():
                 raise SystemExit(3)
 
             if verify(TARGET_ROOT) != "PASS":
+                result["status"] = "FAILED"
+                result["reason"] = "INTEGRATION_VERIFY_FAILED"
+
+                save_run_state(
+                    run_state_file,
+                    run_id=run_id,
+                    original_task=task,
+                    started_at=started_at,
+                    results=all_results,
+                    status="FAILED",
+                    plan_file=plan_file,
+                    reason="INTEGRATION_VERIFY_FAILED",
+                )
+
                 print()
                 print(
                     f'Integration verification failed after '
@@ -646,7 +787,28 @@ def main():
 
             cleanup_worker(result)
 
+            save_run_state(
+                run_state_file,
+                run_id=run_id,
+                original_task=task,
+                started_at=started_at,
+                results=all_results,
+                status="RUNNING",
+                plan_file=plan_file,
+            )
+
         if blocked:
+            save_run_state(
+                run_state_file,
+                run_id=run_id,
+                original_task=task,
+                started_at=started_at,
+                results=all_results,
+                status="BLOCKED",
+                plan_file=plan_file,
+                reason="WAVE_PARTIALLY_BLOCKED",
+            )
+
             state_file = STATE_ROOT / f"blocked-{run_id}.json"
             state_file.write_text(json.dumps(all_results, indent=2))
 
@@ -666,13 +828,34 @@ def main():
     print("=====================================")
 
     if verify(TARGET_ROOT) != "PASS":
+        save_run_state(
+            run_state_file,
+            run_id=run_id,
+            original_task=task,
+            started_at=started_at,
+            results=all_results,
+            status="FAILED",
+            plan_file=plan_file,
+            reason="FINAL_VERIFY_FAILED",
+        )
         raise SystemExit("Final verification failed.")
+
+    save_run_state(
+        run_state_file,
+        run_id=run_id,
+        original_task=task,
+        started_at=started_at,
+        results=all_results,
+        status="COMPLETED",
+        plan_file=plan_file,
+    )
 
     print()
     print("=====================================")
     print(" FACTORY COMPLETE")
     print("=====================================")
-    print(f"Plan: {plan_file}")
+    print(f"Plan : {plan_file}")
+    print(f"State: {run_state_file}")
     print(f"Tasks completed: {len(all_results)}")
 
 
