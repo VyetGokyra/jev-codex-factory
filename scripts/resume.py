@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import factory
+
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
 STATE_ROOT = ENGINE_ROOT / "state"
@@ -205,6 +207,229 @@ def update_run_state(
     save_state(canonical_path, data)
 
 
+
+def replan_after_resume(run_state):
+    original_task = run_state.get("original_task")
+
+    if not original_task:
+        return {
+            "goal_complete": True,
+            "summary": "No original goal is available for replanning.",
+            "shared_integration_files": [],
+            "tasks": [],
+        }
+
+    completed = []
+
+    for result in run_state.get("results", []):
+        if result.get("status") not in {
+            "MERGED",
+            "COMPLETED",
+        }:
+            continue
+
+        task = result.get("task", {})
+
+        completed.append({
+            "id": task.get("id"),
+            "title": task.get("title"),
+            "acceptance": task.get("acceptance", []),
+            "status": result.get("status"),
+        })
+
+    run_id = str(run_state.get("run_id") or "resume")
+    replan_file = STATE_ROOT / f"replan-{run_id}.json"
+
+    completed_json = json.dumps(
+        completed,
+        indent=2,
+    )
+
+    prompt = f"""
+You are the parent software-engineering orchestrator performing a
+post-resume completion check.
+
+ORIGINAL USER GOAL:
+{original_task}
+
+TASKS ALREADY COMPLETED OR MERGED:
+{completed_json}
+
+The repository has changed since the original plan. Inspect the CURRENT
+repository state before deciding anything.
+
+Determine whether the ORIGINAL USER GOAL is now fully satisfied.
+
+Important rules:
+- Judge completion against the original user goal, not merely the old plan.
+- Previously blocked prerequisites may now exist.
+- Do not recreate work that is already complete.
+- Do not create a task merely to restore a prerequisite if that prerequisite
+  already exists in the repository.
+- If implementation work remains after a prerequisite was restored, create
+  the implementation task.
+- Create only the smallest remaining substantive tasks.
+- A single remaining task is valid.
+- Zero remaining tasks is valid.
+- Parallel tasks must not own overlapping files.
+- Do not modify the repository.
+- Do not implement anything.
+- Never search above the repository root.
+- Restrict inspection to the current repository.
+- Ignore .git, .venv, node_modules, build directories, caches and generated
+  artifacts unless directly relevant.
+
+Set goal_complete=true only when the current repository already satisfies
+the original user goal.
+
+If goal_complete=true, tasks MUST be empty.
+
+Return only the requested structured result.
+"""
+
+    cmd = [
+        "codex",
+        "exec",
+        "-s",
+        "read-only",
+        "-m",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="medium"',
+        "-C",
+        TARGET_ROOT,
+        "--output-schema",
+        ENGINE_ROOT / "schemas" / "replan.schema.json",
+        "-o",
+        replan_file,
+        prompt,
+    ]
+
+    r = run(cmd, cwd=TARGET_ROOT)
+
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"Replan failed with exit code {r.returncode}"
+        )
+
+    result = json.loads(replan_file.read_text())
+
+    if result["goal_complete"] and result["tasks"]:
+        raise RuntimeError(
+            "Invalid replan: goal_complete=true but tasks are present."
+        )
+
+    if not result["goal_complete"] and not result["tasks"]:
+        raise RuntimeError(
+            "Invalid replan: goal incomplete but no remaining tasks."
+        )
+
+    print()
+    print("=====================================")
+    print(" POST-RESUME REPLAN")
+    print("=====================================")
+    print(json.dumps(result, indent=2))
+
+    return result
+
+
+
+def execute_replan_tasks(run_state, replan):
+    tasks = replan.get("tasks", [])
+
+    if not tasks:
+        return []
+
+    run_id = str(run_state.get("run_id") or "resume")
+
+    print()
+    print("=====================================")
+    print(" EXECUTE REPLAN TASKS")
+    print("=====================================")
+
+    completed_ids = {
+        r.get("task", {}).get("id")
+        for r in run_state.get("results", [])
+        if r.get("status") in {"MERGED", "COMPLETED"}
+    }
+
+    pending = []
+
+    for task in tasks:
+        deps = task.get("depends_on", [])
+
+        unknown = [
+            dep for dep in deps
+            if dep not in completed_ids
+            and dep not in {t["id"] for t in tasks}
+        ]
+
+        if unknown:
+            raise RuntimeError(
+                f"Replan task {task['id']} has unknown dependencies: "
+                f"{unknown}"
+            )
+
+        pending.append(task)
+
+    new_results = []
+
+    while pending:
+        ready = [
+            task for task in pending
+            if all(
+                dep in completed_ids
+                for dep in task.get("depends_on", [])
+            )
+        ]
+
+        if not ready:
+            raise RuntimeError(
+                "Replan dependency cycle or unresolved dependency."
+            )
+
+        base_commit = output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=TARGET_ROOT,
+        )
+
+        for task in ready:
+            result = factory.run_worker(
+                run_id,
+                task,
+                base_commit,
+            )
+
+            new_results.append(result)
+
+            if result.get("status") != "READY_TO_MERGE":
+                return new_results
+
+            if not factory.merge_worker(result):
+                return new_results
+
+            verification = verify(TARGET_ROOT)
+
+            if verification != "PASS":
+                result["status"] = "FAILED"
+                result["reason"] = (
+                    f"REPLAN_INTEGRATION_VERIFY_{verification}"
+                )
+                return new_results
+
+            factory.cleanup_worker(result)
+
+            completed_ids.add(task["id"])
+
+        ready_ids = {task["id"] for task in ready}
+        pending = [
+            task for task in pending
+            if task["id"] not in ready_ids
+        ]
+
+    return new_results
+
+
 def main():
     state_file = resolve_state(
         sys.argv[1] if len(sys.argv) > 1 else None
@@ -244,6 +469,83 @@ def main():
 
     if not blocked:
         print("No blocked tasks remain.")
+
+        if canonical_state is None or not canonical_state.exists():
+            return
+
+        canonical_data = json.loads(
+            canonical_state.read_text()
+        )
+
+        replan = replan_after_resume(
+            canonical_data
+        )
+
+        if replan["goal_complete"]:
+            update_run_state(
+                canonical_state,
+                results,
+                status="COMPLETED",
+                reason=None,
+            )
+
+            print()
+            print("Original goal is already complete.")
+            return
+
+        new_results = execute_replan_tasks(
+            canonical_data,
+            replan,
+        )
+
+        results.extend(new_results)
+
+        failed_replan = [
+            r for r in new_results
+            if r.get("status") != "MERGED"
+        ]
+
+        if failed_replan:
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason="REPLAN_TASK_FAILED",
+            )
+
+            raise SystemExit(2)
+
+        final_after_replan = verify(
+            TARGET_ROOT
+        )
+
+        if final_after_replan != "PASS":
+            update_run_state(
+                canonical_state,
+                results,
+                status="FAILED",
+                reason=(
+                    "POST_REPLAN_FINAL_VERIFY_"
+                    f"{final_after_replan}"
+                ),
+            )
+
+            raise SystemExit(
+                f"Post-replan final verification: "
+                f"{final_after_replan}"
+            )
+
+        update_run_state(
+            canonical_state,
+            results,
+            status="COMPLETED",
+            reason=None,
+        )
+
+        print()
+        print("=====================================")
+        print(" REPLAN COMPLETE")
+        print("=====================================")
         return
 
     print()
@@ -637,6 +939,58 @@ def main():
         raise SystemExit(
             f"Final verification: {final}"
         )
+
+    if canonical_state is not None and canonical_state.exists():
+        canonical_data = json.loads(
+            canonical_state.read_text()
+        )
+
+        replan = replan_after_resume(
+            canonical_data
+        )
+
+        if not replan["goal_complete"]:
+            new_results = execute_replan_tasks(
+                canonical_data,
+                replan,
+            )
+
+            results.extend(new_results)
+
+            failed_replan = [
+                r for r in new_results
+                if r.get("status") != "MERGED"
+            ]
+
+            if failed_replan:
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="BLOCKED",
+                    reason="REPLAN_TASK_FAILED",
+                )
+
+                raise SystemExit(2)
+
+            final_after_replan = verify(
+                TARGET_ROOT
+            )
+
+            if final_after_replan != "PASS":
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="FAILED",
+                    reason=(
+                        "POST_REPLAN_FINAL_VERIFY_"
+                        f"{final_after_replan}"
+                    ),
+                )
+
+                raise SystemExit(
+                    f"Post-replan final verification: "
+                    f"{final_after_replan}"
+                )
 
     update_run_state(
         canonical_state,

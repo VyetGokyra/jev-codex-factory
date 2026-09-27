@@ -1,0 +1,62 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "goal_complete",
+    "summary",
+    "shared_integration_files",
+    "tasks"
+  ],
+  "properties": {
+    "goal_complete": {
+      "type": "boolean"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "shared_integration_files": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "prompt",
+          "files",
+          "depends_on",
+          "acceptance"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "files": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "depends_on": {
+            "type": "array",
+            "items": {"type": "string"}
+          },
+          "acceptance": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        }
+      }
+    }
+  }
+}
