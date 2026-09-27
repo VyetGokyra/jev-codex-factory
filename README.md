@@ -2,6 +2,20 @@
 
 # ⚡ Jev Codex Factory
 
+<p align="center">
+  <a href="https://github.com/VyetGokyra/jev-codex-factory/actions/workflows/ci.yml">
+    <img src="https://github.com/VyetGokyra/jev-codex-factory/actions/workflows/ci.yml/badge.svg" alt="CI">
+  </a>
+  <a href="https://github.com/VyetGokyra/jev-codex-factory/releases/tag/v0.1.0">
+    <img src="https://img.shields.io/github/v/release/VyetGokyra/jev-codex-factory" alt="Release">
+  </a>
+  <a href="https://github.com/VyetGokyra/jev-codex-factory/blob/main/LICENSE">
+    <img src="https://img.shields.io/github/license/VyetGokyra/jev-codex-factory" alt="License">
+  </a>
+  <img src="https://img.shields.io/badge/Jev-powered-7c3aed" alt="Jev powered">
+  <img src="https://img.shields.io/badge/Codex-multi--agent-111827" alt="Codex multi-agent">
+</p>
+
 ### Route smarter. Code in parallel. Resume what breaks.
 
 **A Jev-powered multi-agent coding factory for OpenAI Codex.**
