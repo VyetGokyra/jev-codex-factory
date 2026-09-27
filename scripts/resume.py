@@ -12,15 +12,24 @@ STATE_ROOT = ENGINE_ROOT / "state"
 TARGET_ROOT = Path.cwd().resolve()
 
 
-def run(cmd, cwd=None, capture=False):
+def run(cmd, cwd=None, capture=False, env=None):
     cmd = [str(x) for x in cmd]
     print("+", " ".join(cmd))
+
+    merged_env = os.environ.copy()
+
+    if env:
+        merged_env.update({
+            str(k): str(v)
+            for k, v in env.items()
+        })
 
     return subprocess.run(
         cmd,
         cwd=cwd,
         text=True,
         capture_output=capture,
+        env=merged_env,
     )
 
 
@@ -309,13 +318,33 @@ def main():
 
         prompt = worker_prompt(task)
 
+        resume_run_id = infer_run_id(state_file, data) or "resume"
+
+        telemetry_dir = STATE_ROOT / "workers" / resume_run_id
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+
+        telemetry_path = telemetry_dir / f"{tid}.json"
+
         worker = run(
             [
                 ENGINE_ROOT / "scripts" / "run.sh",
                 prompt,
             ],
             cwd=wt,
+            env={
+                "JEV_TELEMETRY_FILE": telemetry_path,
+                "JEV_RUN_ID": resume_run_id,
+                "JEV_TASK_ID": tid,
+            },
         )
+
+        if telemetry_path.exists():
+            try:
+                result.update(
+                    json.loads(telemetry_path.read_text())
+                )
+            except Exception as exc:
+                print("Warning: resume telemetry read failed:", exc)
 
         if worker.returncode != 0:
             result["status"] = "BLOCKED"
@@ -338,6 +367,74 @@ def main():
             ["git", "status", "--porcelain"],
             cwd=wt,
         )
+
+        if not status:
+            print()
+            print(
+                f"Resume task {tid} is already satisfied "
+                "after synchronization; no worker changes required."
+            )
+
+            final_check = verify(TARGET_ROOT)
+
+            if final_check != "PASS":
+                result["status"] = "BLOCKED"
+                result["reason"] = (
+                    f"RESUME_NO_CHANGE_VERIFY_{final_check}"
+                )
+
+                save_state(state_file, data)
+
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="BLOCKED",
+                    reason=result["reason"],
+                )
+                continue
+
+            target_head = output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=TARGET_ROOT,
+            )
+
+            result["status"] = "MERGED"
+            result["reason"] = None
+            result["commit"] = target_head
+            result["verify_result"] = "PASS"
+
+            save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="RUNNING",
+                reason=None,
+            )
+
+            run(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    wt,
+                ],
+                cwd=TARGET_ROOT,
+            )
+
+            run(
+                [
+                    "git",
+                    "branch",
+                    "-D",
+                    branch,
+                ],
+                cwd=TARGET_ROOT,
+            )
+
+            print("RESUMED + SATISFIED:", tid)
+            continue
 
         if status:
             run(["git", "add", "-A"], cwd=wt)
