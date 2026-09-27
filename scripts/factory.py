@@ -274,19 +274,51 @@ def calculate_waves(tasks):
 
 
 def check_wave_file_overlap(wave):
-    ownership = {}
+    ownership = []
+
+    def normalize_owned_path(filename):
+        key = filename.strip().replace("\\", "/")
+        key = key.rstrip("/")
+
+        if key in {"", "."}:
+            return "."
+
+        while key.startswith("./"):
+            key = key[2:]
+
+        return key
+
+    def overlaps(a, b):
+        if a == "." or b == ".":
+            return True
+
+        if a == b:
+            return True
+
+        return (
+            a.startswith(b + "/")
+            or b.startswith(a + "/")
+        )
 
     for task in wave:
         for filename in task["files"]:
-            key = filename.rstrip("/")
+            key = normalize_owned_path(filename)
 
-            if key in ownership:
-                raise RuntimeError(
-                    f"Parallel ownership conflict: "
-                    f'{task["id"]} and {ownership[key]} both own {filename}'
+            for existing_key, existing_task, existing_filename in ownership:
+                if overlaps(key, existing_key):
+                    raise RuntimeError(
+                        "Parallel ownership conflict: "
+                        f'{task["id"]} owns {filename}, while '
+                        f'{existing_task} owns {existing_filename}'
+                    )
+
+            ownership.append(
+                (
+                    key,
+                    task["id"],
+                    filename,
                 )
-
-            ownership[key] = task["id"]
+            )
 
 
 def worker_prompt(task):
@@ -340,6 +372,110 @@ def with_telemetry(result, telemetry_path):
     return result
 
 
+
+GENERATED_ARTIFACT_NAMES = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+}
+
+GENERATED_ARTIFACT_SUFFIXES = {
+    ".pyc",
+    ".pyo",
+}
+
+
+def find_generated_artifacts(root):
+    root = Path(root)
+    found = []
+
+    for path in root.rglob("*"):
+        if ".git" in path.parts:
+            continue
+
+        if (
+            path.name in GENERATED_ARTIFACT_NAMES
+            or path.suffix in GENERATED_ARTIFACT_SUFFIXES
+        ):
+            found.append(path)
+
+    return found
+
+
+def remove_generated_artifacts(root):
+    import shutil
+
+    for path in find_generated_artifacts(root):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+
+def cleanup_stale_worker_ref(run_id, task_id):
+    branch = f"jev/{run_id}/{task_id}"
+    wt = (
+        Path("/tmp/jev-codex-factory")
+        / str(run_id)
+        / str(task_id)
+    )
+
+    # Remove stale worktree registration/path first.
+    run(
+        ["git", "worktree", "prune"],
+        cwd=TARGET_ROOT,
+    )
+
+    if wt.exists():
+        run(
+            [
+                "git",
+                "worktree",
+                "remove",
+                "--force",
+                str(wt),
+            ],
+            cwd=TARGET_ROOT,
+        )
+
+        # If the path is no longer registered as a worktree but its
+        # directory survived an interrupted run, remove the stale path.
+        if wt.exists():
+            shutil.rmtree(
+                wt,
+                ignore_errors=True,
+            )
+
+    # Branch may remain after an interrupted previous run.
+    branch_check = run(
+        [
+            "git",
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        ],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if branch_check.returncode == 0:
+        run(
+            [
+                "git",
+                "branch",
+                "-D",
+                branch,
+            ],
+            cwd=TARGET_ROOT,
+        )
+
+
 def run_worker(run_id, task, base_commit):
     tid = sanitize(task["id"])
     branch = f"jev/{run_id}/{tid}"
@@ -356,14 +492,10 @@ def run_worker(run_id, task, base_commit):
     if telemetry_path.exists():
         telemetry_path.unlink()
 
-    if wt.exists():
-        shutil.rmtree(wt)
-
     with GIT_WORKTREE_LOCK:
-        # Clear stale administrative entries before creating a new worktree.
-        run(
-            ["git", "worktree", "prune"],
-            cwd=TARGET_ROOT,
+        cleanup_stale_worker_ref(
+            run_id,
+            tid,
         )
 
         create = run(
@@ -477,7 +609,12 @@ def run_worker(run_id, task, base_commit):
 
         return result
 
-    status = output(["git", "status", "--porcelain"], cwd=wt)
+    remove_generated_artifacts(wt)
+
+    status = output(
+        ["git", "status", "--porcelain"],
+        cwd=wt,
+    )
 
     if not status:
         return with_telemetry({
@@ -528,6 +665,32 @@ def merge_worker(result):
     print()
     print(f"========== MERGE GATE {tid} ==========")
 
+    dirty = run(
+        ["git", "status", "--porcelain"],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if dirty.returncode != 0:
+        result["status"] = "FAILED"
+        result["reason"] = "TARGET_STATUS_FAILED"
+        return False
+
+    if dirty.stdout.strip():
+        print("Target repository is dirty; refusing merge.")
+        print(dirty.stdout)
+
+        result["status"] = "FAILED"
+        result["reason"] = "TARGET_DIRTY_BEFORE_MERGE"
+        return False
+
+    pre_merge_head = output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=TARGET_ROOT,
+    )
+
+    result["pre_merge_head"] = pre_merge_head
+
     merged = run(
         [
             "git",
@@ -574,6 +737,89 @@ def merge_worker(result):
         return False
 
     result["status"] = "MERGED"
+    return True
+
+
+
+
+def cleanup_generated_artifacts(root):
+    import shutil
+
+    root = Path(root)
+
+    cache_dirs = {
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+
+    for path in root.rglob("*"):
+        if path.is_dir() and path.name in cache_dirs:
+            shutil.rmtree(path, ignore_errors=True)
+
+    for pattern in ("*.pyc", "*.pyo"):
+        for path in root.rglob(pattern):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def rollback_merged_worker(result):
+    pre_merge_head = result.get("pre_merge_head")
+
+    if not pre_merge_head:
+        result["rollback_status"] = "SKIPPED_NO_PRE_MERGE_HEAD"
+        return False
+
+    print()
+    print(
+        f"========== ROLLBACK {result['task']['id']} =========="
+    )
+    print(f"Restoring target HEAD -> {pre_merge_head}")
+
+    reset = run(
+        [
+            "git",
+            "reset",
+            "--hard",
+            pre_merge_head,
+        ],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if reset.returncode != 0:
+        print(reset.stdout)
+        print(reset.stderr)
+
+        result["rollback_status"] = "FAILED"
+        return False
+
+    # Verification or workers may leave generated artifacts behind.
+    # The target repository was required to be clean before merge, so these
+    # known cache artifacts were not part of the user's pre-merge state.
+    cleanup_generated_artifacts(TARGET_ROOT)
+
+    remaining = run(
+        ["git", "status", "--porcelain"],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if remaining.returncode != 0:
+        result["rollback_status"] = "FAILED_STATUS_CHECK"
+        return False
+
+    if remaining.stdout.strip():
+        print("Rollback restored HEAD but working tree is still dirty:")
+        print(remaining.stdout)
+
+        result["rollback_status"] = "FAILED_DIRTY_WORKTREE"
+        return False
+
+    result["rollback_status"] = "COMPLETED"
     return True
 
 
@@ -791,6 +1037,13 @@ def execute_task_waves(
                 result["reason"] = (
                     f"INTEGRATION_VERIFY_{integration_verify}"
                 )
+
+                rollback_ok = rollback_merged_worker(
+                    result
+                )
+
+                if not rollback_ok:
+                    result["reason"] += "_ROLLBACK_FAILED"
 
                 notify(
                     status="FAILED",
