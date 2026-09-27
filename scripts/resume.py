@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import factory
+import states
 
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
@@ -397,10 +398,10 @@ def main():
 
     blocked = [
         r for r in results
-        if r.get("status") in {
-            "BLOCKED",
-            "CONFLICTED",
-        }
+        if (
+            states.is_blocked(r.get("status"))
+            or r.get("status") == states.CONFLICTED
+        )
     ]
 
     if not blocked:
@@ -828,10 +829,10 @@ def main():
 
     remaining = [
         r for r in results
-        if r.get("status") in {
-            "BLOCKED",
-            "CONFLICTED",
-        }
+        if (
+            states.is_blocked(r.get("status"))
+            or r.get("status") == states.CONFLICTED
+        )
     ]
 
     print()
