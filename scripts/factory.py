@@ -609,6 +609,198 @@ def save_run_state(
     tmp.replace(path)
 
 
+
+def execute_task_waves(
+    run_id,
+    tasks,
+    *,
+    completed_ids=None,
+    max_workers=3,
+    on_update=None,
+):
+    """
+    Shared DAG executor used by both initial plans and post-resume replans.
+
+    Returns:
+        {
+            "status": "COMPLETED" | "BLOCKED" | "FAILED" | "CONFLICTED",
+            "reason": str | None,
+            "results": [...],
+        }
+    """
+    completed = set(completed_ids or [])
+    pending = {task["id"]: task for task in tasks}
+    task_ids = set(pending)
+
+    # Validate IDs.
+    if len(task_ids) != len(tasks):
+        raise RuntimeError("Duplicate task IDs")
+
+    # Validate dependencies. Dependencies may point either to another task
+    # in this execution or to an already-completed task from a previous run.
+    valid_dependencies = task_ids | completed
+
+    for task in tasks:
+        deps = set(task.get("depends_on", []))
+
+        unknown = deps - valid_dependencies
+        if unknown:
+            raise RuntimeError(
+                f'{task["id"]} has unknown dependencies: {unknown}'
+            )
+
+        if task["id"] in deps:
+            raise RuntimeError(
+                f'{task["id"]} depends on itself'
+            )
+
+    results = []
+
+    def notify(status="RUNNING", reason=None):
+        if on_update:
+            on_update(
+                results,
+                status=status,
+                reason=reason,
+            )
+
+    notify()
+
+    wave_index = 0
+
+    while pending:
+        wave_index += 1
+
+        ready_tasks = [
+            task
+            for task in pending.values()
+            if set(task.get("depends_on", [])).issubset(completed)
+        ]
+
+        if not ready_tasks:
+            raise RuntimeError(
+                "Dependency cycle or unresolved dependency detected"
+            )
+
+        print()
+        print("=====================================")
+        print(f" SHARED WAVE {wave_index}")
+        print("=====================================")
+
+        check_wave_file_overlap(ready_tasks)
+
+        base_commit = output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=TARGET_ROOT,
+        )
+
+        wave_results = []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(max_workers, len(ready_tasks))
+        ) as pool:
+            futures = [
+                pool.submit(
+                    run_worker,
+                    run_id,
+                    task,
+                    base_commit,
+                )
+                for task in ready_tasks
+            ]
+
+            for future in futures:
+                wave_results.append(future.result())
+
+        results.extend(wave_results)
+        notify()
+
+        ready_to_merge = [
+            result
+            for result in wave_results
+            if result.get("status") == "READY_TO_MERGE"
+        ]
+
+        blocked = [
+            result
+            for result in wave_results
+            if result.get("status") != "READY_TO_MERGE"
+        ]
+
+        if blocked:
+            print()
+            print("========== PARTIAL BLOCK ==========")
+
+            for result in blocked:
+                print(
+                    result["task"]["id"],
+                    result.get("status"),
+                    result.get("reason"),
+                    result.get("worktree"),
+                )
+
+        # Merge successful workers even when another independent worker
+        # in the same wave is blocked.
+        for result in ready_to_merge:
+            if not merge_worker(result):
+                notify(
+                    status="CONFLICTED",
+                    reason=result.get("reason") or "MERGE_CONFLICT",
+                )
+
+                return {
+                    "status": "CONFLICTED",
+                    "reason": result.get("reason") or "MERGE_CONFLICT",
+                    "results": results,
+                }
+
+            integration_verify = verify(TARGET_ROOT)
+
+            if integration_verify != "PASS":
+                result["status"] = "FAILED"
+                result["reason"] = (
+                    f"INTEGRATION_VERIFY_{integration_verify}"
+                )
+
+                notify(
+                    status="FAILED",
+                    reason=result["reason"],
+                )
+
+                return {
+                    "status": "FAILED",
+                    "reason": result["reason"],
+                    "results": results,
+                }
+
+            cleanup_worker(result)
+
+            completed.add(result["task"]["id"])
+            pending.pop(result["task"]["id"], None)
+
+            notify()
+
+        if blocked:
+            notify(
+                status="BLOCKED",
+                reason="WAVE_PARTIALLY_BLOCKED",
+            )
+
+            return {
+                "status": "BLOCKED",
+                "reason": "WAVE_PARTIALLY_BLOCKED",
+                "results": results,
+            }
+
+    notify(status="COMPLETED")
+
+    return {
+        "status": "COMPLETED",
+        "reason": None,
+        "results": results,
+    }
+
+
 def main():
     if len(sys.argv) < 2:
         raise SystemExit('usage: jfactory "large task"')
@@ -657,52 +849,17 @@ def main():
     print()
     print(json.dumps(plan, indent=2))
 
-    waves = calculate_waves(plan["tasks"])
-
     all_results = []
 
-    save_run_state(
-        run_state_file,
-        run_id=run_id,
-        original_task=task,
-        started_at=started_at,
-        results=all_results,
+    def update_factory_state(
+        current_results,
+        *,
         status="RUNNING",
-        plan_file=plan_file,
-    )
+        reason=None,
+    ):
+        nonlocal all_results
 
-    for wave_index, wave in enumerate(waves, 1):
-        print()
-        print("=====================================")
-        print(f" WAVE {wave_index}")
-        print("=====================================")
-
-        check_wave_file_overlap(wave)
-
-        base_commit = output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=TARGET_ROOT,
-        )
-
-        results = []
-
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(3, len(wave))
-        ) as pool:
-            futures = [
-                pool.submit(
-                    run_worker,
-                    run_id,
-                    task_item,
-                    base_commit,
-                )
-                for task_item in wave
-            ]
-
-            for f in futures:
-                results.append(f.result())
-
-        all_results.extend(results)
+        all_results = current_results
 
         save_run_state(
             run_state_file,
@@ -710,117 +867,49 @@ def main():
             original_task=task,
             started_at=started_at,
             results=all_results,
-            status="RUNNING",
+            status=status,
             plan_file=plan_file,
+            reason=reason,
         )
 
-        ready = [
-            r for r in results
-            if r["status"] == "READY_TO_MERGE"
-        ]
+    outcome = execute_task_waves(
+        run_id,
+        plan["tasks"],
+        on_update=update_factory_state,
+    )
 
-        blocked = [
-            r for r in results
-            if r["status"] != "READY_TO_MERGE"
-        ]
+    all_results = outcome["results"]
 
-        if blocked:
-            print()
-            print("========== PARTIAL BLOCK ==========")
+    if outcome["status"] != "COMPLETED":
+        legacy_prefix = {
+            "BLOCKED": "blocked",
+            "CONFLICTED": "conflict",
+            "FAILED": "verify-fail",
+        }.get(outcome["status"], "blocked")
 
-            for r in blocked:
-                print(
-                    r["task"]["id"],
-                    r["status"],
-                    r.get("reason"),
-                    r.get("worktree"),
-                )
+        state_file = (
+            STATE_ROOT
+            / f"{legacy_prefix}-{run_id}.json"
+        )
 
-        for result in ready:
-            if not merge_worker(result):
-                save_run_state(
-                    run_state_file,
-                    run_id=run_id,
-                    original_task=task,
-                    started_at=started_at,
-                    results=all_results,
-                    status="CONFLICTED",
-                    plan_file=plan_file,
-                    reason="MERGE_CONFLICT",
-                )
+        state_file.write_text(
+            json.dumps(all_results, indent=2) + "\n"
+        )
 
-                state_file = STATE_ROOT / f"conflict-{run_id}.json"
-                state_file.write_text(json.dumps(all_results, indent=2))
+        print()
+        print("=====================================")
+        print(f" FACTORY {outcome['status']}")
+        print("=====================================")
+        print("Reason:", outcome.get("reason"))
+        print("State :", run_state_file)
 
-                print()
-                print("Integration conflict.")
-                print(f"State saved: {state_file}")
-                print(
-                    f'Worktree preserved: {result["worktree"]}'
-                )
-                raise SystemExit(3)
+        exit_code = {
+            "BLOCKED": 2,
+            "CONFLICTED": 3,
+            "FAILED": 4,
+        }.get(outcome["status"], 2)
 
-            if verify(TARGET_ROOT) != "PASS":
-                result["status"] = "FAILED"
-                result["reason"] = "INTEGRATION_VERIFY_FAILED"
-
-                save_run_state(
-                    run_state_file,
-                    run_id=run_id,
-                    original_task=task,
-                    started_at=started_at,
-                    results=all_results,
-                    status="FAILED",
-                    plan_file=plan_file,
-                    reason="INTEGRATION_VERIFY_FAILED",
-                )
-
-                print()
-                print(
-                    f'Integration verification failed after '
-                    f'{result["task"]["id"]}.'
-                )
-
-                state_file = STATE_ROOT / f"verify-fail-{run_id}.json"
-                state_file.write_text(json.dumps(all_results, indent=2))
-                raise SystemExit(4)
-
-            cleanup_worker(result)
-
-            save_run_state(
-                run_state_file,
-                run_id=run_id,
-                original_task=task,
-                started_at=started_at,
-                results=all_results,
-                status="RUNNING",
-                plan_file=plan_file,
-            )
-
-        if blocked:
-            save_run_state(
-                run_state_file,
-                run_id=run_id,
-                original_task=task,
-                started_at=started_at,
-                results=all_results,
-                status="BLOCKED",
-                plan_file=plan_file,
-                reason="WAVE_PARTIALLY_BLOCKED",
-            )
-
-            state_file = STATE_ROOT / f"blocked-{run_id}.json"
-            state_file.write_text(json.dumps(all_results, indent=2))
-
-            print()
-            print("=====================================")
-            print(" WAVE PARTIALLY COMPLETE")
-            print("=====================================")
-            print(f"Merged tasks: {len(ready)}")
-            print(f"Blocked tasks: {len(blocked)}")
-            print(f"State saved: {state_file}")
-            print("Blocked worktrees are preserved for debugging/resume.")
-            raise SystemExit(2)
+        raise SystemExit(exit_code)
 
     print()
     print("=====================================")

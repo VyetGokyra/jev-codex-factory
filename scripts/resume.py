@@ -334,6 +334,7 @@ Return only the requested structured result.
 
 
 
+
 def execute_replan_tasks(run_state, replan):
     tasks = replan.get("tasks", [])
 
@@ -348,86 +349,21 @@ def execute_replan_tasks(run_state, replan):
     print("=====================================")
 
     completed_ids = {
-        r.get("task", {}).get("id")
-        for r in run_state.get("results", [])
-        if r.get("status") in {"MERGED", "COMPLETED"}
+        result.get("task", {}).get("id")
+        for result in run_state.get("results", [])
+        if result.get("status") in {
+            "MERGED",
+            "COMPLETED",
+        }
     }
 
-    pending = []
+    outcome = factory.execute_task_waves(
+        run_id,
+        tasks,
+        completed_ids=completed_ids,
+    )
 
-    for task in tasks:
-        deps = task.get("depends_on", [])
-
-        unknown = [
-            dep for dep in deps
-            if dep not in completed_ids
-            and dep not in {t["id"] for t in tasks}
-        ]
-
-        if unknown:
-            raise RuntimeError(
-                f"Replan task {task['id']} has unknown dependencies: "
-                f"{unknown}"
-            )
-
-        pending.append(task)
-
-    new_results = []
-
-    while pending:
-        ready = [
-            task for task in pending
-            if all(
-                dep in completed_ids
-                for dep in task.get("depends_on", [])
-            )
-        ]
-
-        if not ready:
-            raise RuntimeError(
-                "Replan dependency cycle or unresolved dependency."
-            )
-
-        base_commit = output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=TARGET_ROOT,
-        )
-
-        for task in ready:
-            result = factory.run_worker(
-                run_id,
-                task,
-                base_commit,
-            )
-
-            new_results.append(result)
-
-            if result.get("status") != "READY_TO_MERGE":
-                return new_results
-
-            if not factory.merge_worker(result):
-                return new_results
-
-            verification = verify(TARGET_ROOT)
-
-            if verification != "PASS":
-                result["status"] = "FAILED"
-                result["reason"] = (
-                    f"REPLAN_INTEGRATION_VERIFY_{verification}"
-                )
-                return new_results
-
-            factory.cleanup_worker(result)
-
-            completed_ids.add(task["id"])
-
-        ready_ids = {task["id"] for task in ready}
-        pending = [
-            task for task in pending
-            if task["id"] not in ready_ids
-        ]
-
-    return new_results
+    return outcome["results"]
 
 
 def main():
