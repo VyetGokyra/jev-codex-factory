@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+
+import concurrent.futures
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+ENGINE_ROOT = Path(__file__).resolve().parent.parent
+TARGET_ROOT = Path.cwd().resolve()
+
+STATE_ROOT = ENGINE_ROOT / "state"
+LOG_ROOT = ENGINE_ROOT / "logs"
+
+STATE_ROOT.mkdir(exist_ok=True)
+LOG_ROOT.mkdir(exist_ok=True)
+
+
+def run(cmd, cwd=None, capture=False, check=False):
+    print("+", " ".join(str(x) for x in cmd))
+
+    return subprocess.run(
+        [str(x) for x in cmd],
+        cwd=cwd,
+        text=True,
+        capture_output=capture,
+        check=check,
+    )
+
+
+def output(cmd, cwd=None):
+    r = run(cmd, cwd=cwd, capture=True, check=True)
+    return r.stdout.strip()
+
+
+def sanitize(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-").lower()
+
+
+def verify(repo):
+    custom = repo / "scripts" / "verify.sh"
+
+    if custom.exists() and os.access(custom, os.X_OK):
+        cmd = [str(custom)]
+    else:
+        cmd = [str(ENGINE_ROOT / "scripts" / "verify.sh")]
+
+    print()
+    print("========== VERIFY ==========")
+    r = run(cmd, cwd=repo)
+
+    if r.returncode == 0:
+        return "PASS"
+
+    if r.returncode == 2:
+        return "INCONCLUSIVE"
+
+    return "FAIL"
+
+
+def get_shape(task):
+    r = run(
+        [
+            sys.executable,
+            ENGINE_ROOT / "scripts" / "jev_shape.py",
+            task,
+        ],
+        cwd=ENGINE_ROOT,
+        capture=True,
+    )
+
+    if r.returncode != 0:
+        print(r.stderr)
+        raise RuntimeError("Jev shape routing failed")
+
+    result = json.loads(r.stdout)
+    print("JEV #0:", json.dumps(result, indent=2))
+    return result
+
+
+def run_single(task):
+    print()
+    print("=====================================")
+    print(" SINGLE AGENT")
+    print("=====================================")
+
+    r = run(
+        [ENGINE_ROOT / "scripts" / "run.sh", task],
+        cwd=TARGET_ROOT,
+    )
+
+    raise SystemExit(r.returncode)
+
+
+def make_plan(task, plan_file):
+    prompt = f"""
+You are the parent software-engineering orchestrator.
+
+Goal:
+{task}
+
+Inspect the repository before planning.
+
+Decompose the goal into the smallest useful set of substantial subtasks.
+
+Rules:
+- Only create multiple subtasks when they represent meaningful work.
+- Every subtask must have a clear deliverable.
+- Assign explicit file ownership to each subtask.
+- Parallel-ready subtasks must not own overlapping files.
+- If two tasks require the same files, express the dependency so they run sequentially.
+- Reserve genuinely shared integration files for the parent in shared_integration_files.
+- Do not implement anything.
+- Do not modify the repository.
+- Produce only the requested structured plan.
+"""
+
+    cmd = [
+        "codex",
+        "exec",
+        "-m",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="high"',
+        "-C",
+        TARGET_ROOT,
+        "--output-schema",
+        ENGINE_ROOT / "schemas" / "plan.schema.json",
+        "-o",
+        plan_file,
+        prompt,
+    ]
+
+    r = run(cmd, cwd=TARGET_ROOT)
+
+    if r.returncode != 0:
+        raise RuntimeError("Parent planning failed")
+
+    return json.loads(plan_file.read_text())
+
+
+def validate_plan(plan):
+    tasks = plan["tasks"]
+
+    ids = [t["id"] for t in tasks]
+
+    if len(ids) != len(set(ids)):
+        raise RuntimeError("Duplicate task IDs in plan")
+
+    valid = set(ids)
+
+    for task in tasks:
+        unknown = set(task["depends_on"]) - valid
+        if unknown:
+            raise RuntimeError(
+                f'{task["id"]} has unknown dependencies: {unknown}'
+            )
+
+        if task["id"] in task["depends_on"]:
+            raise RuntimeError(f'{task["id"]} depends on itself')
+
+
+def calculate_waves(tasks):
+    pending = {t["id"]: t for t in tasks}
+    completed = set()
+    waves = []
+
+    while pending:
+        ready = [
+            t
+            for t in pending.values()
+            if set(t["depends_on"]).issubset(completed)
+        ]
+
+        if not ready:
+            raise RuntimeError("Dependency cycle detected")
+
+        waves.append(ready)
+
+        for task in ready:
+            completed.add(task["id"])
+            del pending[task["id"]]
+
+    return waves
+
+
+def check_wave_file_overlap(wave):
+    ownership = {}
+
+    for task in wave:
+        for filename in task["files"]:
+            key = filename.rstrip("/")
+
+            if key in ownership:
+                raise RuntimeError(
+                    f"Parallel ownership conflict: "
+                    f'{task["id"]} and {ownership[key]} both own {filename}'
+                )
+
+            ownership[key] = task["id"]
+
+
+def worker_prompt(task):
+    owned = "\n".join(f"- {x}" for x in task["files"])
+    acceptance = "\n".join(f"- {x}" for x in task["acceptance"])
+
+    return f"""
+You are an isolated implementation worker.
+
+SUBTASK:
+{task["title"]}
+
+INSTRUCTIONS:
+{task["prompt"]}
+
+Generated artifacts must never be committed. Ignore or remove:
+- __pycache__/
+- *.pyc
+- .pytest_cache/
+- .mypy_cache/
+- .ruff_cache/
+
+FILE OWNERSHIP:
+{owned}
+
+ACCEPTANCE CRITERIA:
+{acceptance}
+
+Rules:
+- Work only on this subtask.
+- Modify only files inside the declared ownership scope.
+- Do not perform unrelated refactors.
+- If completing the task requires modifying files outside ownership,
+  do not silently expand scope. Report the blocker instead.
+- Run relevant targeted verification before finishing.
+"""
+
+
+def run_worker(run_id, task, base_commit):
+    tid = sanitize(task["id"])
+    branch = f"jev/{run_id}/{tid}"
+
+    wt_root = Path("/tmp/jev-codex-factory") / run_id
+    wt_root.mkdir(parents=True, exist_ok=True)
+
+    wt = wt_root / tid
+
+    if wt.exists():
+        shutil.rmtree(wt)
+
+    create = run(
+        [
+            "git",
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            wt,
+            base_commit,
+        ],
+        cwd=TARGET_ROOT,
+    )
+
+    if create.returncode != 0:
+        return {
+            "task": task,
+            "status": "BLOCKED",
+            "reason": "WORKTREE_CREATE_FAILED",
+            "branch": branch,
+            "worktree": str(wt),
+        }
+
+    prompt = worker_prompt(task)
+
+    worker = run(
+        [
+            ENGINE_ROOT / "scripts" / "run.sh",
+            prompt,
+        ],
+        cwd=wt,
+    )
+
+    if worker.returncode != 0:
+        return {
+            "task": task,
+            "status": "BLOCKED",
+            "reason": f"WORKER_EXIT_{worker.returncode}",
+            "branch": branch,
+            "worktree": str(wt),
+        }
+
+    status = output(["git", "status", "--porcelain"], cwd=wt)
+
+    if not status:
+        return {
+            "task": task,
+            "status": "BLOCKED",
+            "reason": "NO_CHANGES_PRODUCED",
+            "branch": branch,
+            "worktree": str(wt),
+        }
+
+    if status:
+        run(["git", "add", "-A"], cwd=wt, check=True)
+
+        commit = run(
+            [
+                "git",
+                "commit",
+                "-m",
+                f'agent({task["id"]}): {task["title"]}',
+            ],
+            cwd=wt,
+        )
+
+        if commit.returncode != 0:
+            return {
+                "task": task,
+                "status": "BLOCKED",
+                "reason": "COMMIT_FAILED",
+                "branch": branch,
+                "worktree": str(wt),
+            }
+
+    commit_sha = output(["git", "rev-parse", "HEAD"], cwd=wt)
+
+    return {
+        "task": task,
+        "status": "READY_TO_MERGE",
+        "branch": branch,
+        "commit": commit_sha,
+        "worktree": str(wt),
+    }
+
+
+def merge_worker(result):
+    branch = result["branch"]
+    tid = result["task"]["id"]
+
+    print()
+    print(f"========== MERGE GATE {tid} ==========")
+
+    merged = run(
+        [
+            "git",
+            "merge",
+            "--no-ff",
+            "--no-commit",
+            branch,
+        ],
+        cwd=TARGET_ROOT,
+        capture=True,
+    )
+
+    if merged.returncode != 0:
+        print(merged.stdout)
+        print(merged.stderr)
+
+        run(
+            ["git", "merge", "--abort"],
+            cwd=TARGET_ROOT,
+        )
+
+        result["status"] = "CONFLICTED"
+        result["reason"] = "MERGE_CONFLICT"
+        return False
+
+    committed = run(
+        [
+            "git",
+            "commit",
+            "-m",
+            f"merge agent task {tid}",
+        ],
+        cwd=TARGET_ROOT,
+    )
+
+    if committed.returncode != 0:
+        run(
+            ["git", "merge", "--abort"],
+            cwd=TARGET_ROOT,
+        )
+
+        result["status"] = "CONFLICTED"
+        result["reason"] = "MERGE_COMMIT_FAILED"
+        return False
+
+    result["status"] = "MERGED"
+    return True
+
+
+def cleanup_worker(result):
+    wt = result.get("worktree")
+    branch = result.get("branch")
+
+    if wt:
+        run(
+            ["git", "worktree", "remove", "--force", wt],
+            cwd=TARGET_ROOT,
+        )
+
+    if branch:
+        run(
+            ["git", "branch", "-D", branch],
+            cwd=TARGET_ROOT,
+        )
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise SystemExit('usage: jfactory "large task"')
+
+    task = " ".join(sys.argv[1:])
+
+    if not (TARGET_ROOT / ".git").exists():
+        raise SystemExit(
+            "jfactory requires the current directory to be a Git repository."
+        )
+
+    shape = get_shape(task)
+
+    if shape["decision"] == "SINGLE_AGENT":
+        run_single(task)
+
+    if shape["decision"] == "NEEDS_HUMAN":
+        raise SystemExit("Jev requested human clarification.")
+
+    if shape["decision"] != "DECOMPOSE":
+        raise SystemExit(
+            f'Unknown shape decision: {shape["decision"]}'
+        )
+
+    dirty = output(["git", "status", "--porcelain"], cwd=TARGET_ROOT)
+
+    if dirty:
+        raise SystemExit(
+            "DECOMPOSE requires a clean working tree. "
+            "Commit or stash current changes first."
+        )
+
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    plan_file = STATE_ROOT / f"plan-{run_id}.json"
+
+    print()
+    print("=====================================")
+    print(" CODEX PARENT: DECOMPOSE")
+    print("=====================================")
+
+    plan = make_plan(task, plan_file)
+    validate_plan(plan)
+
+    print()
+    print(json.dumps(plan, indent=2))
+
+    waves = calculate_waves(plan["tasks"])
+
+    all_results = []
+
+    for wave_index, wave in enumerate(waves, 1):
+        print()
+        print("=====================================")
+        print(f" WAVE {wave_index}")
+        print("=====================================")
+
+        check_wave_file_overlap(wave)
+
+        base_commit = output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=TARGET_ROOT,
+        )
+
+        results = []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(3, len(wave))
+        ) as pool:
+            futures = [
+                pool.submit(
+                    run_worker,
+                    run_id,
+                    task_item,
+                    base_commit,
+                )
+                for task_item in wave
+            ]
+
+            for f in futures:
+                results.append(f.result())
+
+        all_results.extend(results)
+
+        ready = [
+            r for r in results
+            if r["status"] == "READY_TO_MERGE"
+        ]
+
+        blocked = [
+            r for r in results
+            if r["status"] != "READY_TO_MERGE"
+        ]
+
+        if blocked:
+            print()
+            print("========== PARTIAL BLOCK ==========")
+
+            for r in blocked:
+                print(
+                    r["task"]["id"],
+                    r["status"],
+                    r.get("reason"),
+                    r.get("worktree"),
+                )
+
+        for result in ready:
+            if not merge_worker(result):
+                state_file = STATE_ROOT / f"conflict-{run_id}.json"
+                state_file.write_text(json.dumps(all_results, indent=2))
+
+                print()
+                print("Integration conflict.")
+                print(f"State saved: {state_file}")
+                print(
+                    f'Worktree preserved: {result["worktree"]}'
+                )
+                raise SystemExit(3)
+
+            if verify(TARGET_ROOT) != "PASS":
+                print()
+                print(
+                    f'Integration verification failed after '
+                    f'{result["task"]["id"]}.'
+                )
+
+                state_file = STATE_ROOT / f"verify-fail-{run_id}.json"
+                state_file.write_text(json.dumps(all_results, indent=2))
+                raise SystemExit(4)
+
+            cleanup_worker(result)
+
+        if blocked:
+            state_file = STATE_ROOT / f"blocked-{run_id}.json"
+            state_file.write_text(json.dumps(all_results, indent=2))
+
+            print()
+            print("=====================================")
+            print(" WAVE PARTIALLY COMPLETE")
+            print("=====================================")
+            print(f"Merged tasks: {len(ready)}")
+            print(f"Blocked tasks: {len(blocked)}")
+            print(f"State saved: {state_file}")
+            print("Blocked worktrees are preserved for debugging/resume.")
+            raise SystemExit(2)
+
+    print()
+    print("=====================================")
+    print(" FINAL VERIFY")
+    print("=====================================")
+
+    if verify(TARGET_ROOT) != "PASS":
+        raise SystemExit("Final verification failed.")
+
+    print()
+    print("=====================================")
+    print(" FACTORY COMPLETE")
+    print("=====================================")
+    print(f"Plan: {plan_file}")
+    print(f"Tasks completed: {len(all_results)}")
+
+
+if __name__ == "__main__":
+    main()

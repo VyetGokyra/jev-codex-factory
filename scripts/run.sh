@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+TASK="${*:-}"
+
+if [ -z "$TASK" ]; then
+    echo 'Usage: ./scripts/run.sh "your task"'
+    exit 1
+fi
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ENGINE_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+TARGET_ROOT="$(pwd)"
+cd "$ENGINE_ROOT"
+
+if [ -f ".venv/bin/activate" ]; then
+    source ".venv/bin/activate"
+fi
+
+mkdir -p state logs
+
+echo
+echo "====================================="
+echo " JEV #1 - PRE ROUTE"
+echo "====================================="
+
+RESULT="$(python scripts/jev_router.py "$TASK")"
+echo "$RESULT"
+
+DECISION="$(
+python -c '
+import json,sys
+x=json.load(sys.stdin)
+print(x["decision"])
+' <<< "$RESULT"
+)"
+
+CONFIDENCE="$(
+python -c '
+import json,sys
+x=json.load(sys.stdin)
+print(x["confidence"])
+' <<< "$RESULT"
+)"
+
+echo
+echo "Decision   : $DECISION"
+echo "Confidence : $CONFIDENCE"
+
+LOW_CONF="$(
+python -c '
+import sys
+print("yes" if float(sys.argv[1]) < 0.60 else "no")
+' "$CONFIDENCE"
+)"
+
+if [ "$LOW_CONF" = "yes" ]; then
+    echo "Jev confidence < 0.60"
+
+    if [ "$DECISION" = "STOP_AND_REPORT" ]; then
+        echo "STOP_AND_REPORT"
+        exit 2
+    fi
+
+    if [ "$DECISION" != "VERIFY_ONLY" ]; then
+        echo "Low-confidence routing: fallback -> SOL_MEDIUM"
+        DECISION="SOL_MEDIUM"
+    fi
+fi
+
+run_codex() {
+    local worker="$1"
+    local task="$2"
+
+    case "$worker" in
+        LUNA_LOW)
+            MODEL="gpt-5.6-luna"
+            EFFORT="low"
+            ;;
+        LUNA_HIGH)
+            MODEL="gpt-5.6-luna"
+            EFFORT="high"
+            ;;
+        TERRA_HIGH)
+            MODEL="gpt-5.6-terra"
+            EFFORT="high"
+            ;;
+        SOL_MEDIUM)
+            MODEL="gpt-5.6-sol"
+            EFFORT="medium"
+            ;;
+        SOL_HIGH)
+            MODEL="gpt-5.6-sol"
+            EFFORT="high"
+            ;;
+        SOL_XHIGH)
+            MODEL="gpt-5.6-sol"
+            EFFORT="xhigh"
+            ;;
+        ASTRA_HIGH)
+            MODEL="gpt-6-astra"
+            EFFORT="high"
+            ;;
+        *)
+            echo "Unknown worker: $worker"
+            return 3
+            ;;
+    esac
+
+    echo
+    echo "====================================="
+    echo " CODEX WORKER: $worker"
+    echo " MODEL: $MODEL"
+    echo "====================================="
+
+    codex exec \
+        -s workspace-write \
+        -m "$MODEL" \
+        -c model_reasoning_effort="\"$EFFORT\"" \
+        -C "$TARGET_ROOT" \
+        -o "$ENGINE_ROOT/state/codex_last.txt" \
+        "$task"
+}
+
+run_verify() {
+    echo
+    echo "====================================="
+    echo " VERIFY: $TARGET_ROOT"
+    echo "====================================="
+
+    set +e
+    if [ -x "$TARGET_ROOT/scripts/verify.sh" ]; then
+        (cd "$TARGET_ROOT" && ./scripts/verify.sh) | tee "$ENGINE_ROOT/logs/verify_last.log"
+    else
+        (cd "$TARGET_ROOT" && "$ENGINE_ROOT/scripts/verify.sh") | tee "$ENGINE_ROOT/logs/verify_last.log"
+    fi
+    VERIFY_EXIT=${PIPESTATUS[0]}
+    set -e
+
+    return "$VERIFY_EXIT"
+}
+
+case "$DECISION" in
+    LUNA_LOW|LUNA_HIGH|TERRA_HIGH|SOL_MEDIUM|SOL_HIGH|SOL_XHIGH|ASTRA_HIGH)
+        WORKER="$DECISION"
+        ;;
+
+    VERIFY_ONLY)
+        if run_verify; then
+            echo
+            echo "DONE: verification passed."
+            exit 0
+        else
+            echo
+            echo "Verification failed."
+            exit 1
+        fi
+        ;;
+
+    STOP_AND_REPORT)
+        echo "Jev requested STOP_AND_REPORT."
+        exit 2
+        ;;
+
+    *)
+        echo "Unknown Jev decision: $DECISION"
+        exit 3
+        ;;
+esac
+
+ATTEMPTS=0
+MAX_ATTEMPTS=2
+
+while true; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+
+    set +e
+    run_codex "$WORKER" "$TASK"
+    CODEX_EXIT=$?
+    set -e
+
+    echo
+    echo "Codex exit code: $CODEX_EXIT"
+
+    if run_verify; then
+        echo
+        echo "====================================="
+        echo " DONE"
+        echo "====================================="
+        echo "Worker   : $WORKER"
+        echo "Attempts : $ATTEMPTS"
+        echo "Verify   : PASS"
+        exit 0
+    fi
+
+    VERIFY_EXIT=$?
+
+    echo
+    echo "Verification failed with exit code: $VERIFY_EXIT"
+
+    if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+        echo "Maximum repair attempts reached."
+        echo "STOP_AND_REPORT"
+        exit 2
+    fi
+
+    echo
+    echo "====================================="
+    echo " JEV #2 - POST FAILURE"
+    echo "====================================="
+
+    POST_RESULT="$(
+        python scripts/jev_after_run.py \
+            "$TASK" \
+            "$WORKER" \
+            "$VERIFY_EXIT" \
+            "$ATTEMPTS"
+    )"
+
+    echo "$POST_RESULT"
+
+    POST_DECISION="$(
+    python -c '
+import json,sys
+x=json.load(sys.stdin)
+print(x["decision"])
+' <<< "$POST_RESULT"
+    )"
+
+    POST_CONFIDENCE="$(
+    python -c '
+import json,sys
+x=json.load(sys.stdin)
+print(x["confidence"])
+' <<< "$POST_RESULT"
+    )"
+
+    echo
+    echo "Post decision   : $POST_DECISION"
+    echo "Post confidence : $POST_CONFIDENCE"
+
+    LOW_POST_CONF="$(
+    python -c '
+import sys
+print("yes" if float(sys.argv[1]) < 0.60 else "no")
+' "$POST_CONFIDENCE"
+    )"
+
+    if [ "$LOW_POST_CONF" = "yes" ]; then
+        echo "Post-run Jev confidence < 0.60"
+        echo "STOP_AND_REPORT"
+        exit 2
+    fi
+
+    case "$POST_DECISION" in
+        RETRY_LUNA)
+            WORKER="LUNA"
+            ;;
+
+        ESCALATE_SOL)
+            WORKER="SOL"
+            ;;
+
+        STOP_AND_REPORT)
+            echo "Jev requested STOP_AND_REPORT."
+            exit 2
+            ;;
+
+        *)
+            echo "Unknown post-run decision: $POST_DECISION"
+            exit 3
+            ;;
+    esac
+done
