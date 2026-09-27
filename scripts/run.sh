@@ -129,7 +129,7 @@ if [ "$LOW_CONF" = "yes" ]; then
 
     if [ "$DECISION" = "STOP_AND_REPORT" ]; then
         echo "STOP_AND_REPORT"
-        write_telemetry "BLOCKED" "NOT_RUN" "" "0"
+        write_telemetry "BLOCKED_RESOURCE" "NOT_RUN" "" "0"
         exit 2
     fi
 
@@ -238,7 +238,7 @@ case "$DECISION" in
     STOP_AND_REPORT)
         WORKER="STOP_AND_REPORT"
         echo "Jev requested STOP_AND_REPORT."
-        write_telemetry "BLOCKED" "NOT_RUN" "" "0"
+        write_telemetry "BLOCKED_RESOURCE" "NOT_RUN" "" "0"
         exit 2
         ;;
 

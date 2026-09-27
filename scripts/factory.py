@@ -11,6 +11,8 @@ import threading
 import time
 from pathlib import Path
 
+import states
+
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
 TARGET_ROOT = Path.cwd().resolve()
@@ -423,7 +425,7 @@ def run_worker(run_id, task, base_commit):
     if create.returncode != 0:
         return {
             "task": task,
-            "status": "BLOCKED",
+            "status": "FAILED",
             "reason": "WORKTREE_CREATE_FAILED",
             "branch": branch,
             "worktree": str(wt),
@@ -445,20 +447,42 @@ def run_worker(run_id, task, base_commit):
     )
 
     if worker.returncode != 0:
-        return with_telemetry({
+        telemetry = load_worker_telemetry(telemetry_path)
+
+        worker_status = states.normalize(
+            telemetry.get("worker_status")
+        )
+
+        if worker_status in {
+            states.BLOCKED_RESOURCE,
+            states.BLOCKED_DEPENDENCY,
+            states.NEEDS_HUMAN,
+        }:
+            status = worker_status
+        else:
+            status = states.FAILED
+
+        result = {
             "task": task,
-            "status": "BLOCKED",
+            "status": status,
             "reason": f"WORKER_EXIT_{worker.returncode}",
             "branch": branch,
             "worktree": str(wt),
-        }, telemetry_path)
+        }
+
+        result.update(telemetry)
+
+        # Canonical state wins over legacy telemetry.
+        result["status"] = status
+
+        return result
 
     status = output(["git", "status", "--porcelain"], cwd=wt)
 
     if not status:
         return with_telemetry({
             "task": task,
-            "status": "BLOCKED",
+            "status": "FAILED",
             "reason": "NO_CHANGES_PRODUCED",
             "branch": branch,
             "worktree": str(wt),
@@ -480,7 +504,7 @@ def run_worker(run_id, task, base_commit):
         if commit.returncode != 0:
             return with_telemetry({
                 "task": task,
-                "status": "BLOCKED",
+                "status": "FAILED",
                 "reason": "COMMIT_FAILED",
                 "branch": branch,
                 "worktree": str(wt),
@@ -724,7 +748,13 @@ def execute_task_waves(
         blocked = [
             result
             for result in wave_results
-            if result.get("status") != "READY_TO_MERGE"
+            if states.is_blocked(result.get("status"))
+        ]
+
+        failed = [
+            result
+            for result in wave_results
+            if result.get("status") == states.FAILED
         ]
 
         if blocked:
@@ -780,14 +810,42 @@ def execute_task_waves(
 
             notify()
 
-        if blocked:
+        if failed:
+            reason = (
+                failed[0].get("reason")
+                or "WAVE_WORKER_FAILED"
+            )
+
             notify(
-                status="BLOCKED",
+                status=states.FAILED,
+                reason=reason,
+            )
+
+            return {
+                "status": states.FAILED,
+                "reason": reason,
+                "results": results,
+            }
+
+        if blocked:
+            blocked_status = states.normalize(
+                blocked[0].get("status")
+            )
+
+            if blocked_status not in {
+                states.BLOCKED_RESOURCE,
+                states.BLOCKED_DEPENDENCY,
+                states.NEEDS_HUMAN,
+            }:
+                blocked_status = states.BLOCKED_RESOURCE
+
+            notify(
+                status=blocked_status,
                 reason="WAVE_PARTIALLY_BLOCKED",
             )
 
             return {
-                "status": "BLOCKED",
+                "status": blocked_status,
                 "reason": "WAVE_PARTIALLY_BLOCKED",
                 "results": results,
             }
@@ -882,6 +940,9 @@ def main():
 
     if outcome["status"] != "COMPLETED":
         legacy_prefix = {
+            "BLOCKED_RESOURCE": "blocked",
+            "BLOCKED_DEPENDENCY": "blocked",
+            "NEEDS_HUMAN": "blocked",
             "BLOCKED": "blocked",
             "CONFLICTED": "conflict",
             "FAILED": "verify-fail",
@@ -904,6 +965,9 @@ def main():
         print("State :", run_state_file)
 
         exit_code = {
+            "BLOCKED_RESOURCE": 2,
+            "BLOCKED_DEPENDENCY": 2,
+            "NEEDS_HUMAN": 2,
             "BLOCKED": 2,
             "CONFLICTED": 3,
             "FAILED": 4,

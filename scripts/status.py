@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import states
+
 
 ENGINE_ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ENGINE_ROOT / "state"
@@ -80,6 +82,9 @@ def status_icon(status):
         "RUNNING": "…",
         "VERIFYING": "?",
         "BLOCKED": "!",
+        "BLOCKED_RESOURCE": "!",
+        "BLOCKED_DEPENDENCY": "!",
+        "NEEDS_HUMAN": "?",
         "CONFLICTED": "!",
         "FAILED": "✗",
         "NEEDS_HUMAN": "?",
@@ -197,6 +202,9 @@ def main():
         r for r in results
         if r.get("status") in {
             "BLOCKED",
+            "BLOCKED_RESOURCE",
+            "BLOCKED_DEPENDENCY",
+            "NEEDS_HUMAN",
             "CONFLICTED",
             "FAILED",
             "NEEDS_HUMAN",
