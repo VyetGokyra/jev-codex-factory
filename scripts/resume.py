@@ -12,15 +12,24 @@ STATE_ROOT = ENGINE_ROOT / "state"
 TARGET_ROOT = Path.cwd().resolve()
 
 
-def run(cmd, cwd=None, capture=False):
+def run(cmd, cwd=None, capture=False, env=None):
     cmd = [str(x) for x in cmd]
     print("+", " ".join(cmd))
+
+    merged_env = os.environ.copy()
+
+    if env:
+        merged_env.update({
+            str(k): str(v)
+            for k, v in env.items()
+        })
 
     return subprocess.run(
         cmd,
         cwd=cwd,
         text=True,
         capture_output=capture,
+        env=merged_env,
     )
 
 
@@ -114,7 +123,86 @@ def resolve_state(arg=None):
 
 
 def save_state(path, data):
-    path.write_text(json.dumps(data, indent=2))
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def extract_results(data):
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return data["results"]
+
+    raise SystemExit("Unsupported state format.")
+
+
+def infer_run_id(path, data):
+    if isinstance(data, dict) and data.get("run_id"):
+        return str(data["run_id"])
+
+    stem = path.stem
+
+    for prefix in (
+        "blocked-",
+        "conflict-",
+        "verify-fail-",
+        "run-",
+    ):
+        if stem.startswith(prefix):
+            return stem[len(prefix):]
+
+    return None
+
+
+def resolve_canonical_state(state_file, data):
+    run_id = infer_run_id(state_file, data)
+
+    if not run_id:
+        return None
+
+    candidate = STATE_ROOT / f"run-{run_id}.json"
+
+    if candidate.exists():
+        return candidate
+
+    return None
+
+
+def update_run_state(
+    canonical_path,
+    results,
+    *,
+    status=None,
+    reason=None,
+):
+    if canonical_path is None or not canonical_path.exists():
+        return
+
+    data = json.loads(canonical_path.read_text())
+
+    if not isinstance(data, dict):
+        return
+
+    data["results"] = results
+
+    if status is not None:
+        data["status"] = status
+
+    data["reason"] = reason
+
+    import time
+    data["updated_at"] = time.time()
+
+    if status in {
+        "COMPLETED",
+        "BLOCKED",
+        "FAILED",
+        "CONFLICTED",
+        "NEEDS_HUMAN",
+    }:
+        data["finished_at"] = time.time()
+
+    save_state(canonical_path, data)
 
 
 def main():
@@ -139,12 +227,15 @@ def main():
         )
 
     data = json.loads(state_file.read_text())
+    results = extract_results(data)
 
-    if not isinstance(data, list):
-        raise SystemExit("Unsupported state format.")
+    canonical_state = resolve_canonical_state(
+        state_file,
+        data,
+    )
 
     blocked = [
-        r for r in data
+        r for r in results
         if r.get("status") in {
             "BLOCKED",
             "CONFLICTED",
@@ -179,6 +270,13 @@ def main():
             result["status"] = "BLOCKED"
             result["reason"] = "WORKTREE_MISSING"
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
             print("Blocked worktree no longer exists:", wt)
             continue
 
@@ -206,6 +304,13 @@ def main():
             result["reason"] = "RESUME_SYNC_CONFLICT"
             save_state(state_file, data)
 
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
+
             print()
             print("Resume sync conflict.")
             print("Worktree preserved:", wt)
@@ -213,18 +318,45 @@ def main():
 
         prompt = worker_prompt(task)
 
+        resume_run_id = infer_run_id(state_file, data) or "resume"
+
+        telemetry_dir = STATE_ROOT / "workers" / resume_run_id
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+
+        telemetry_path = telemetry_dir / f"{tid}.json"
+
         worker = run(
             [
                 ENGINE_ROOT / "scripts" / "run.sh",
                 prompt,
             ],
             cwd=wt,
+            env={
+                "JEV_TELEMETRY_FILE": telemetry_path,
+                "JEV_RUN_ID": resume_run_id,
+                "JEV_TASK_ID": tid,
+            },
         )
+
+        if telemetry_path.exists():
+            try:
+                result.update(
+                    json.loads(telemetry_path.read_text())
+                )
+            except Exception as exc:
+                print("Warning: resume telemetry read failed:", exc)
 
         if worker.returncode != 0:
             result["status"] = "BLOCKED"
             result["reason"] = f"WORKER_EXIT_{worker.returncode}"
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
 
             print()
             print("Task remains blocked:", tid)
@@ -235,6 +367,74 @@ def main():
             ["git", "status", "--porcelain"],
             cwd=wt,
         )
+
+        if not status:
+            print()
+            print(
+                f"Resume task {tid} is already satisfied "
+                "after synchronization; no worker changes required."
+            )
+
+            final_check = verify(TARGET_ROOT)
+
+            if final_check != "PASS":
+                result["status"] = "BLOCKED"
+                result["reason"] = (
+                    f"RESUME_NO_CHANGE_VERIFY_{final_check}"
+                )
+
+                save_state(state_file, data)
+
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="BLOCKED",
+                    reason=result["reason"],
+                )
+                continue
+
+            target_head = output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=TARGET_ROOT,
+            )
+
+            result["status"] = "MERGED"
+            result["reason"] = None
+            result["commit"] = target_head
+            result["verify_result"] = "PASS"
+
+            save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="RUNNING",
+                reason=None,
+            )
+
+            run(
+                [
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    wt,
+                ],
+                cwd=TARGET_ROOT,
+            )
+
+            run(
+                [
+                    "git",
+                    "branch",
+                    "-D",
+                    branch,
+                ],
+                cwd=TARGET_ROOT,
+            )
+
+            print("RESUMED + SATISFIED:", tid)
+            continue
 
         if status:
             run(["git", "add", "-A"], cwd=wt)
@@ -253,6 +453,13 @@ def main():
                 result["status"] = "BLOCKED"
                 result["reason"] = "RESUME_COMMIT_FAILED"
                 save_state(state_file, data)
+
+                update_run_state(
+                    canonical_state,
+                    results,
+                    status="BLOCKED",
+                    reason=result.get("reason"),
+                )
                 continue
 
         worker_head = output(
@@ -283,6 +490,13 @@ def main():
             result["status"] = "CONFLICTED"
             result["reason"] = "RESUME_MERGE_CONFLICT"
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="CONFLICTED",
+                reason=result.get("reason"),
+            )
             continue
 
         verify_result = verify(TARGET_ROOT)
@@ -300,6 +514,13 @@ def main():
                 f"RESUME_VERIFY_{verify_result}"
             )
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
             continue
 
         commit = run(
@@ -321,6 +542,13 @@ def main():
             result["status"] = "BLOCKED"
             result["reason"] = "RESUME_MERGE_COMMIT_FAILED"
             save_state(state_file, data)
+
+            update_run_state(
+                canonical_state,
+                results,
+                status="BLOCKED",
+                reason=result.get("reason"),
+            )
             continue
 
         result["status"] = "MERGED"
@@ -328,6 +556,13 @@ def main():
         result["commit"] = worker_head
 
         save_state(state_file, data)
+
+        update_run_state(
+            canonical_state,
+            results,
+            status="RUNNING",
+            reason=None,
+        )
 
         run(
             [
@@ -354,7 +589,7 @@ def main():
         print("RESUMED + MERGED:", tid)
 
     remaining = [
-        r for r in data
+        r for r in results
         if r.get("status") in {
             "BLOCKED",
             "CONFLICTED",
@@ -377,6 +612,13 @@ def main():
                 r.get("worktree"),
             )
 
+        update_run_state(
+            canonical_state,
+            results,
+            status="BLOCKED",
+            reason="RESUME_PARTIALLY_BLOCKED",
+        )
+
         raise SystemExit(2)
 
     print(" FINAL VERIFY")
@@ -385,9 +627,23 @@ def main():
     final = verify(TARGET_ROOT)
 
     if final != "PASS":
+        update_run_state(
+            canonical_state,
+            results,
+            status="FAILED",
+            reason=f"FINAL_VERIFY_{final}",
+        )
+
         raise SystemExit(
             f"Final verification: {final}"
         )
+
+    update_run_state(
+        canonical_state,
+        results,
+        status="COMPLETED",
+        reason=None,
+    )
 
     print()
     print("=====================================")
